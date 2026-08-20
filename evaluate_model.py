@@ -34,7 +34,7 @@ class HebrewTextNormalizer:
     def __init__(self):
         self.whisper_normalizer = whisper.normalizers.BasicTextNormalizer()
 
-    def __call__(self, text):
+    def __call__(self, text):  # TODO: Perhaps use HebPipe?
         text = clean_some_unicode_from_text(text)
         text = remove_niqqud(text)
         text = text.replace('"', "").replace("'", "")
