@@ -1,0 +1,12 @@
+asr_eval==0.3.0
+pandas
+matplotlib
+joblib
+diskcache
+dash-extensions
+dash-bootstrap-components
+dash
+asr_eval[datasets]
+Diskcache
+polars
+plotext==5.3.2

@@ -1,41 +1,19 @@
-import os
-os.environ["MPLBACKEND"] = "Agg"
-
-import matplotlib
-matplotlib.use("Agg")
+from pathlib import Path
 
 import pandas as pd
 import plotext as plt
 
-from asr_eval.bench.loader import PredictionLoader
-from asr_eval.bench.evaluator import get_dataset_data
-from asr_eval.bench.datasets._registry import _add_custom_annotations_from_csv
 from asr_eval.align.metrics import dataset_metric_to_dataframe
-from asr_eval.utils.storage import make_storage
+from asr_eval.bench.loader import PredictionLoader
 
-ANNOTATIONS_CSV = "/Users/ofir/Projects/asr-training/temp-wildcard/annotations.csv"
-PREDICTIONS_CSV = "/Users/ofir/Projects/asr-training/temp-wildcard/predictions.csv"
-CACHE_DIR = "/Users/ofir/Projects/asr-training/temp-wildcard/.cache"
-OUTPUT_CSV = "/Users/ofir/Projects/asr-training/temp-wildcard/metrics_report.csv"
+from _common import BENCH_DIR, METRICS, OUTPUT_DIR, benchmark_id, build_loader, iter_dataset_data
 
-METRICS = ('wer', 'n_replacements', 'n_insertions', 'n_deletions')
+SASPEECH_CSV = BENCH_DIR / "saspeech.csv"
 
 
 def build_metrics_dataframe(loader: PredictionLoader) -> pd.DataFrame:
-    combos = sorted(set(
-        (key.dataset_name, key.augmentor, key.parser)
-        for key in loader.grouped_loaded_predictions
-    ))
-
     per_combo_rows: list[pd.DataFrame] = []
-    for dataset_name, augmentor, parser in combos:
-        multiple_alignments = loader.get_multiple_alignments(
-            dataset_name=dataset_name,
-            augmentor_name=augmentor,
-            parser_name=parser,
-        )
-        dataset_data = get_dataset_data(multiple_alignments)
-
+    for dataset_name, augmentor, parser, dataset_data in iter_dataset_data(loader):
         merged: pd.DataFrame | None = None
         for metric in METRICS:
             metric_df = dataset_metric_to_dataframe(
@@ -86,22 +64,18 @@ def print_and_plot(metrics_df: pd.DataFrame):
         plt.show()
 
 
-def main():
-    _add_custom_annotations_from_csv(ANNOTATIONS_CSV)
-
-    loader = PredictionLoader(
-        storage=make_storage(PREDICTIONS_CSV),
-        cache=make_storage(CACHE_DIR),
-        pipelines=('*',),
-        dataset_specs=('*',),
-    )
-
+def generate_metrics_report(input_csv: Path) -> Path:
+    loader = build_loader(input_csv)
     metrics_df = build_metrics_dataframe(loader)
-    metrics_df.to_csv(OUTPUT_CSV, index=False)
-    print(f'Wrote {len(metrics_df)} rows to {OUTPUT_CSV}')
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = OUTPUT_DIR / f"metrics_{benchmark_id(input_csv)}.csv"
+    metrics_df.to_csv(output_path, index=False)
+    print(f'Wrote {len(metrics_df)} rows to {output_path}')
 
     print_and_plot(metrics_df)
+    return output_path
 
 
 if __name__ == "__main__":
-    main()
+    generate_metrics_report(SASPEECH_CSV)
