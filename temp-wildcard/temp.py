@@ -3,6 +3,7 @@ os.environ["MPLBACKEND"] = "Agg"
 
 import matplotlib
 matplotlib.use("Agg")
+import numpy as np
 
 import random
 import sys
@@ -12,34 +13,41 @@ import pandas as pd
 from pathlib import Path
 from asr_eval.bench.dashboard.run import run_dashboard, PredictionLoader, make_storage
 from asr_eval.bench.datasets import register_dataset
+from asr_eval.bench.datasets.mappers import assign_sample_ids
 
 from datasets import Audio, load_dataset, Dataset # type: ignore
 
-from asr_eval.bench.datasets._registry import register_dataset
-from asr_eval.bench.datasets.mappers import assign_sample_ids
-
-# EVAL_FIRST = 11
+EVAL_FIRST = 11
 
 @register_dataset('upai-inc/saspeech', splits=('test',))
 def load_saspeech(split: str = 'test') -> Dataset:
-    df = pd.read_csv("/Users/ofir/Projects/asr-training/temp-wildcard/saspeech.csv")#.iloc[:EVAL_FIRST]
+    csv_path = "/Users/ofir/Projects/asr-training/temp-wildcard/saspeech.csv"
+    
+    dataset = load_dataset(
+        "csv",
+        data_files={split: csv_path},
+        split=split
+    ).sort('id')
 
+    # Apply the limit before processing to save time on the map operations
+    if globals().get('EVAL_FIRST') is not None:
+        limit = min(EVAL_FIRST, len(dataset))
+        dataset = dataset.select(range(limit))
+    
     return (
-        load_dataset(
-            "upai-inc/saspeech",
-            split=split,
-            trust_remote_code=True,
-        )
-        .rename_column('text', 'transcription')
-        .cast_column('audio', Audio(sampling_rate=16_000)) # type: ignore
+        dataset
+        .rename_column('norm_reference_text', 'transcription')
+        
+        # Inject dummy audio (1 second of silence array) for every row
+        #.map(lambda x: {'audio': np.zeros(16000, dtype=np.float32)})
+        #.cast_column('audio', Audio(sampling_rate=16_000)) # type: ignore
+        
         .map(assign_sample_ids, with_indices=True)
-        # Change labels to offline ones
-        #.map(lambda x: {'transcription': df.loc[df['id'] == x['id'], 'norm_reference_text'].values[0]})
     )
 
 def launch_asr_dashboard(input_csv: str):
     # Load your existing dataframe
-    df = pd.read_csv(input_csv)#.iloc[:EVAL_FIRST]
+    df = pd.read_csv(input_csv).sort_values('id').iloc[:EVAL_FIRST]
     
     # Create a temporary directory to house the intermediate files
     # This automatically cleans up when the python script exits
@@ -62,6 +70,7 @@ def launch_asr_dashboard(input_csv: str):
         # Drop duplicates in case multiple engines evaluated the same sample
         annotations_df = annotations_df.drop_duplicates(subset=['dataset_name', 'sample_id'])
         annotations_df.to_csv(ann_path, index=False)
+        annotations_df.to_csv("./annotations.csv", index=False)  # Save a copy in the current directory for reference
         
         # --- 2. Prepare predictions.csv ---
         preds = df[['model', 'engine', 'dataset', 'id', 'norm_predicted_text', 'transcription_time']].copy()
@@ -84,7 +93,7 @@ def launch_asr_dashboard(input_csv: str):
         # Concatenate both metric types into the final predictions format
         predictions_df = pd.concat([preds_text, preds_time], ignore_index=True).sort_values(by=['dataset_name', 'sample_id', 'pipeline_name', 'artifact_type'])
         predictions_df.to_csv(pred_path, index=False)
-        
+        predictions_df.to_csv("./predictions.csv", index=False)  # Save a copy in the current directory for reference
         # --- 3. Launch Dashboard Subprocess ---
         print("Launching asr_eval dashboard...\n")
         
