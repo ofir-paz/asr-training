@@ -133,6 +133,20 @@ class DatasetPreparator:
             lambda labels: len(labels) <= whisper_max_target_positions, input_columns="labels"
         )
 
+    def _select_transcribable_entries(self, dataset):
+        """Drop examples whose transcript is blank.
+
+        Those tokenize down to a bare prefix + end-of-transcript sequence, which teaches
+        the model to emit nothing for audible speech. Dropping them before the feature
+        extraction map also avoids preparing audio we would never train on - scoping the
+        filter to the transcript column keeps the audio undecoded, so this is nearly free.
+        A transcript holding only timestamp tokens is kept: a silent segment is
+        legitimate training signal.
+        """
+        return dataset.filter(
+            lambda transcript: bool(transcript and transcript.strip()), input_columns="transcript"
+        )
+
     def _decide_example_augmentation(self, example, ancillary_features):
         """
         Decide whether to augment the audio with a shift (0 if no augmentation)
@@ -242,12 +256,17 @@ class DatasetPreparator:
         should_train_on_timestamps = bool(self.seed.binomial(1, use_timestamps_sampling_prob))
         should_condition_on_prev = has_prev and bool(self.seed.binomial(1, use_prev_sampling_prob))
 
+        # Stripping is refused for cross-over segments, so track what the tokens actually
+        # end up carrying - the prefix has to follow that rather than what we sampled,
+        # otherwise we emit <|notimestamps|> ahead of a sequence full of timestamps.
+        labels_carry_timestamps = has_timestamps
         if has_timestamps and not should_train_on_timestamps:
             possible_to_strip_timestamps = self._is_removable_timestamp_token_ids(token_ids)
             if possible_to_strip_timestamps:
                 # Remove all timestamp tokens
                 token_ids = [token_id for token_id in token_ids if token_id < self.timestamp_begin_token_id]
                 # Note - no-timestamp token id is prepended as part of the prefix later.
+                labels_carry_timestamps = False
 
         prev_ids = []
         if should_condition_on_prev and has_prev:
@@ -284,8 +303,11 @@ class DatasetPreparator:
         # Know this - prev text labels should include timestamps if the transcription labels do.
         # Since we are unable to inject timestamps into prev text, we cannot accomplish the injection
         # in those cases. Hence, the below check of "prev_ids"
-        # TODO - When this feature is used - sampling probs are skewed since we "add" timestamp attributes on the fly.
-        # this is a bug, and not compatible with the sampling ratios atm.
+        # Note - injection adds the timestamp attribute on the fly, so it is gated by the
+        # relative sampling ratio rather than the raw target rate. On a dataset where no
+        # example carries timestamps the two are equal and injection lands on the requested
+        # share. On a mixed dataset the ratio is scaled up for the examples that do carry
+        # them, so injection still over-fires on the examples that do not.
         if should_train_on_timestamps and not has_timestamps and not prev_ids and self.inject_synthetic_timestamps:
             # Injected timestamps may be "shift forward" augmented.
             # Audio features would have been augmented accordingly.
@@ -298,9 +320,9 @@ class DatasetPreparator:
             # wrap the text segment with the synthetic injected timestamp tokens
             # and append prefix/suffix for timestamp decoding
             token_ids = [start_at_ts_id] + token_ids + [ends_at_ts_id]
-            has_timestamps = True  # So downstream processing handles proper prefixing
+            labels_carry_timestamps = True  # So downstream processing handles proper prefixing
 
-        with_timestamps = has_timestamps and should_train_on_timestamps
+        with_timestamps = labels_carry_timestamps
         prefix_tokens = self.prefix_tokens_with_ts if with_timestamps else self.prefix_tokens_no_ts
         labels_input_ids = prev_ids + prefix_tokens + token_ids + [self.eot_token_id]
 
@@ -406,9 +428,33 @@ class DatasetPreparator:
 
         return results
 
+    @staticmethod
+    def _relative_sampling_ratio(
+        target_prob: float, sampled_ratio: float, forced_ratio: float = 0.0
+    ) -> float:
+        """Convert a target rate over the whole dataset into a per-example sampling rate.
+
+        An attribute is only sampled on the examples where the choice actually exists.
+        Examples carrying it unconditionally (`forced_ratio`) already cover part of the
+        target, so the sampled ones only have to make up the remainder -
+        `(target_prob - forced_ratio) / sampled_ratio`, clamped to a probability.
+
+        A target below `forced_ratio` is unreachable: the ratio clamps to zero and the
+        attribute lands on the forced share. When nothing is sampleable at all, the ratio
+        is meaningless for the strip/keep decision, so we fall back to the target itself -
+        that keeps augmentations which synthesize the attribute (see
+        `inject_synthetic_timestamps`) firing at the requested rate rather than on every
+        example.
+        """
+        if sampled_ratio <= 0:
+            return target_prob
+
+        return min(1.0, max(0.0, (target_prob - forced_ratio) / sampled_ratio))
+
     def prepare_dataset(self, dataset: Dataset):
         dataset = dataset.cast_column("audio", Audio(sampling_rate=self.target_sampling_rate))
         self._validate_dataset_features(dataset)
+        dataset = self._select_transcribable_entries(dataset)
 
         columns_to_remove = dataset.column_names
         # If a DatasetDict was passed in, it contains multiple splits.
@@ -424,7 +470,7 @@ class DatasetPreparator:
         if self.timestamp_sample_prob < 1.0 or self.condition_on_prev_sample_prob < 1.0:
             print(f"Estimating attribute frequencies for relative sub-sampling.")
 
-            def has_timestamps_discriminator(example):
+            def has_removable_timestamps_discriminator(example):
                 has_timestamps = "has_timestamps" in example and example["has_timestamps"]
                 if has_timestamps:
                     token_ids = self._token_ids_from_example(example)
@@ -432,28 +478,46 @@ class DatasetPreparator:
                 else:
                     return False
 
+            def has_forced_timestamps_discriminator(example):
+                has_timestamps = "has_timestamps" in example and example["has_timestamps"]
+                return has_timestamps and not has_removable_timestamps_discriminator(example)
+
             # Estimate the ratios of the attributes in the dataset
             estimations = self.estimate_attribute_ratios(
                 dataset,
                 {
-                    "has_removable_timestamps": has_timestamps_discriminator,
+                    "has_removable_timestamps": has_removable_timestamps_discriminator,
+                    "has_forced_timestamps": has_forced_timestamps_discriminator,
                     "has_prev": lambda example: "has_prev" in example and example["has_prev"],
                 },
                 target_sampling_error_range=0.05,
                 target_sampling_error_confidence=0.95,
                 max_to_sample=4000,
             )
+            estimated_ratios = {attr: est["estimated_ratio"] for attr, est in estimations.items()}
 
+            # Cross-over segments always keep their timestamps, so they put a floor under the
+            # achievable share and only the removable ones are left to sample against it.
+            # A previous transcript is never forced onto an example, so it has no such floor.
+            timestamp_floor = estimated_ratios["has_forced_timestamps"]
             relative_sampling_ratios = {
-                attr: (
-                    min(1.0, self.timestamp_sample_prob / attr_estimation["estimated_ratio"])
-                    if attr_estimation["estimated_ratio"] > 0
-                    else 1.0
-                )
-                for attr, attr_estimation in estimations.items()
+                "has_removable_timestamps": self._relative_sampling_ratio(
+                    self.timestamp_sample_prob,
+                    estimated_ratios["has_removable_timestamps"],
+                    forced_ratio=timestamp_floor,
+                ),
+                "has_prev": self._relative_sampling_ratio(
+                    self.condition_on_prev_sample_prob, estimated_ratios["has_prev"]
+                ),
             }
 
-            estimated_ratios = {attr: est["estimated_ratio"] for attr, est in estimations.items()}
+            if self.timestamp_sample_prob < timestamp_floor:
+                print(
+                    f"Requested timestamp share {self.timestamp_sample_prob:.2f} is below the "
+                    f"{timestamp_floor:.2f} of examples whose timestamps cannot be stripped - "
+                    "preparing at that floor instead."
+                )
+
             print(f"Estimated attribute frequencies: {estimated_ratios}")
             print(f"Relative sampling ratios: {relative_sampling_ratios}")
 

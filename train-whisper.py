@@ -5,7 +5,7 @@ import argparse
 import re
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, List, Union
+from typing import Any, Callable, Dict, List, Union
 
 import evaluate
 import torch
@@ -31,6 +31,66 @@ from preprocess.preperator import (
 # Split on : but allow : inside [] for the HF split slicing syntax
 # https://huggingface.co/docs/datasets/loading#slice-splits
 dataset_spec_split_pattern = r":(?=(?:[^\[\]]|\[[^\[\]]*\])*$)"
+
+# The preparator requires the transcript to live in a "transcript" column, but datasets
+# in the wild name it differently - crowd-transcribe-v5 uses "sentence", saspeech/eval-d1
+# use "text", fleurs uses "transcription". Renaming is metadata-only - no data is copied.
+transcript_column_aliases = ["sentence", "text", "transcription"]
+
+
+def normalize_transcript_column(dataset, dataset_name):
+    if "transcript" in dataset.features:
+        return dataset
+
+    for alias in transcript_column_aliases:
+        if alias in dataset.features:
+            print(f"{dataset_name}: using column '{alias}' as 'transcript'")
+            return dataset.rename_column(alias, "transcript")
+
+    raise ValueError(
+        f"{dataset_name}: no transcript column found "
+        f"(tried 'transcript', {transcript_column_aliases})"
+    )
+
+
+@dataclass
+class DatasetRowFilter:
+    """A quality rule expressed over a dataset's own columns.
+
+    `columns` scopes the predicate to the columns it reads, which is what keeps the audio
+    column undecoded - filtering whole rows would decode every example in the dataset.
+    """
+
+    columns: List[str]
+    keep: Callable[..., bool]
+
+
+# Some datasets carry quality signals of their own that are not part of the training
+# schema. Those rules are declared per dataset here rather than teaching the shared
+# preparator about columns only one dataset has. Length is deliberately not filtered on -
+# the preparator already drops examples whose labels exceed the model's target positions.
+dataset_row_filters = {
+    "ivrit-ai/crowd-transcribe-v5": DatasetRowFilter(
+        columns=["extra_data"],
+        keep=lambda extra_data: not any(
+            extra_data[flag]
+            for flag in ("skipped", "unintelligible", "foreign_language", "noisy", "multiple_speakers")
+        ),
+    ),
+}
+
+
+def apply_dataset_row_filter(dataset, dataset_name):
+    row_filter = dataset_row_filters.get(dataset_name)
+    if row_filter is None:
+        return dataset
+
+    filtered = dataset.filter(row_filter.keep, input_columns=row_filter.columns)
+    print(
+        f"{dataset_name}: quality filter dropped "
+        f"{dataset.num_rows - filtered.num_rows} of {dataset.num_rows} rows"
+    )
+    return filtered
 
 
 def load_datasets(dataset_specs):
@@ -77,7 +137,8 @@ def load_datasets(dataset_specs):
             if to_entry is not None:
                 dataset = dataset.take(to_entry - from_entry)
 
-        datasets.append(dataset)
+        dataset = normalize_transcript_column(dataset, dataset_name)
+        datasets.append(apply_dataset_row_filter(dataset, dataset_name))
     return datasets
 
 
