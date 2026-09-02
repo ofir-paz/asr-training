@@ -275,10 +275,12 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
         self._kd_kl_total = 0.0
         self._kd_kl_steps = 0
 
+        self.teacher_dtype = None
         if self.teacher_model is not None:
             self.teacher_model.to(self.args.device)
             self.teacher_model.eval()
             self.teacher_model.requires_grad_(False)
+            self.teacher_dtype = next(self.teacher_model.parameters()).dtype
 
     def _transcription_loss(self, logits, labels, num_items_in_batch, label_smoothing):
         # Until the Whisper model loss is updated to use the new Transfomers loss infrastruture,
@@ -334,8 +336,16 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
             )
 
             if self.teacher_model is not None and self.kd_weight > 0 and model.training:
+                # A reduced-precision teacher will not accept the full precision features the
+                # collator produces, so match them to its weights explicitly rather than rely
+                # on an ambient autocast region being active. Integer inputs - the decoder
+                # prefix - must be left alone.
+                teacher_inputs = {
+                    name: value.to(self.teacher_dtype) if torch.is_floating_point(value) else value
+                    for name, value in inputs.items()
+                }
                 with torch.no_grad():
-                    teacher_logits = self.teacher_model(**inputs).logits
+                    teacher_logits = self.teacher_model(**teacher_inputs).logits
                 kl = self._teacher_kl(outputs.logits, teacher_logits, labels)
                 self._kd_kl_total += kl.item()
                 self._kd_kl_steps += 1
@@ -439,6 +449,13 @@ def parse_arguments():
         help="Attention implementation to use (only 'sdpa' available)",
     )
     parser.add_argument("--use_qlora", action="store_true", help="Use QLoRA for training")
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Recompute activations during the backward pass instead of storing them. "
+        "Trades roughly 30%% more compute for a large drop in activation memory, which is "
+        "what caps the per-device batch size on a single accelerator",
+    )
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
     # Transformers gives warmup_steps precedence whenever it is > 0, which silently
     # discarded warmup_ratio. Accept exactly one and translate it in main().
@@ -624,9 +641,20 @@ def main():
     teacher_model = None
     if args.kd_weight > 0:
         teacher_name = args.kd_teacher_model or args.model_name
-        print(f"Loading frozen KD teacher: {teacher_name} (weight={args.kd_weight}, T={args.kd_temperature})")
+        # The teacher is frozen and only ever runs forward, so it can be held at whatever
+        # reduced precision the autocast region already computes in - that halves its
+        # footprint and keeps its dtype matching the activations flowing through it even
+        # when autocast is not active. Deriving this from --mixed_precision rather than
+        # exposing a separate flag keeps the two from contradicting each other. tf32 is an
+        # fp32 compute mode, so it correctly maps to full precision here.
+        teacher_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(args.mixed_precision)
+        print(
+            f"Loading frozen KD teacher: {teacher_name} "
+            f"(weight={args.kd_weight}, T={args.kd_temperature}, "
+            f"dtype={teacher_dtype or torch.get_default_dtype()})"
+        )
         teacher_model = WhisperForConditionalGeneration.from_pretrained(
-            teacher_name, attn_implementation=args.attn_implementation
+            teacher_name, attn_implementation=args.attn_implementation, torch_dtype=teacher_dtype
         )
         # No generation happens on the teacher - skip the cache it would otherwise build
         teacher_model.config.use_cache = False
@@ -671,6 +699,10 @@ def main():
         save_total_limit=args.max_checkpoints_to_keep,
         # Configure save_only_model
         save_only_model=True if args.save_only_model else None,
+        gradient_checkpointing=args.gradient_checkpointing,
+        # Whisper keeps no cache during training, so the non-reentrant implementation is safe
+        # and is the one that composes with the rest of the Trainer machinery.
+        gradient_checkpointing_kwargs={"use_reentrant": False} if args.gradient_checkpointing else None,
         # There is not branching in training the Whisper model
         ddp_find_unused_parameters=False,
         # This would take longer, but will calculate the loss
