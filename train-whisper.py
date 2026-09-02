@@ -272,8 +272,9 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
         self.kd_weight = kd_weight
         self.kd_temperature = kd_temperature
         self.label_smoothing = label_smoothing
+        self._ce_total = 0.0
         self._kd_kl_total = 0.0
-        self._kd_kl_steps = 0
+        self._loss_steps = 0
 
         self.teacher_dtype = None
         if self.teacher_model is not None:
@@ -334,6 +335,9 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
                 num_items_in_batch,
                 label_smoothing=self.label_smoothing if model.training else 0.0,
             )
+            if model.training:
+                self._ce_total += loss.item()
+                self._loss_steps += 1
 
             if self.teacher_model is not None and self.kd_weight > 0 and model.training:
                 # A reduced-precision teacher will not accept the full precision features the
@@ -348,7 +352,6 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
                     teacher_logits = self.teacher_model(**teacher_inputs).logits
                 kl = self._teacher_kl(outputs.logits, teacher_logits, labels)
                 self._kd_kl_total += kl.item()
-                self._kd_kl_steps += 1
                 loss = loss + self.kd_weight * kl
         finally:
             inputs["labels"] = labels
@@ -356,11 +359,19 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs, start_time=None):
-        # Surface the raw KL alongside the loss so drift from the teacher is visible
-        if self._kd_kl_steps:
-            logs["kd_kl"] = self._kd_kl_total / self._kd_kl_steps
+        # train/loss folds together the smoothed cross entropy and the KL penalty, which
+        # leaves a long unattended run undiagnosable - a rising total could be either the
+        # model fitting worse or the teacher penalty taking over. Report both terms.
+        if self._loss_steps:
+            logs["ce"] = self._ce_total / self._loss_steps
+            if self.teacher_model is not None and self.kd_weight > 0:
+                logs["kd_kl"] = self._kd_kl_total / self._loss_steps
+                logs["kd_share"] = (self.kd_weight * self._kd_kl_total) / max(
+                    self._ce_total + self.kd_weight * self._kd_kl_total, 1e-12
+                )
+            self._ce_total = 0.0
             self._kd_kl_total = 0.0
-            self._kd_kl_steps = 0
+            self._loss_steps = 0
         super().log(logs, start_time)
 
 
