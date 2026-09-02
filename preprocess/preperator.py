@@ -303,11 +303,14 @@ class DatasetPreparator:
         # Know this - prev text labels should include timestamps if the transcription labels do.
         # Since we are unable to inject timestamps into prev text, we cannot accomplish the injection
         # in those cases. Hence, the below check of "prev_ids"
-        # Note - injection adds the timestamp attribute on the fly, so it is gated by the
-        # relative sampling ratio rather than the raw target rate. On a dataset where no
-        # example carries timestamps the two are equal and injection lands on the requested
-        # share. On a mixed dataset the ratio is scaled up for the examples that do carry
-        # them, so injection still over-fires on the examples that do not.
+        # Note - injection adds the timestamp attribute on the fly, so it fires at the
+        # relative sampling ratio rather than the raw target rate. That ratio is derived
+        # for the examples that already carry removable timestamps, so the two only agree
+        # when no example in the dataset carries any - which is exactly when injection is
+        # useful, and where it lands on the requested share. On a dataset that mixes both
+        # kinds, applying that ratio here misses the target in whichever direction the
+        # forced share pushes it. Every dataset in use is all-or-nothing on timestamps, so
+        # this has no effect today; revisit if a genuinely mixed source is added.
         if should_train_on_timestamps and not has_timestamps and not prev_ids and self.inject_synthetic_timestamps:
             # Injected timestamps may be "shift forward" augmented.
             # Audio features would have been augmented accordingly.
