@@ -19,7 +19,6 @@ from transformers import (
     WhisperForConditionalGeneration,
     WhisperProcessor,
 )
-from transformers.modeling_outputs import Seq2SeqLMOutput
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 
 from preprocess.preperator import (
@@ -242,27 +241,117 @@ def prepare_model_for_qlora(model):
     return model
 
 
-def compute_loss_func(
-    outputs: Seq2SeqLMOutput,
-    labels: torch.Tensor,
-    num_items_in_batch: int,
-):
-    # Until the Whisper model loss is updated to use the new Transfomers loss infrastruture,
-    # it suffers from  bug in how grad acc steps loss is calculated. This is a workaround.
-    # See https://huggingface.co/blog/gradient_accumulation
+class WhisperDistillationTrainer(Seq2SeqTrainer):
+    """Seq2SeqTrainer with label smoothing and an optional frozen-teacher KL penalty.
 
-    lm_logits = outputs.logits
-    vocab_size = lm_logits.shape[2]
-    reduction = "sum" if num_items_in_batch is not None else "mean"
-    loss_fct = torch.nn.CrossEntropyLoss(reduction=reduction)
-    # move labels to correct device to enable PP
-    labels = labels.to(lm_logits.device)
+    The loss lives here rather than in a `compute_loss_func` hook because that hook only
+    receives the outputs and labels - running a teacher needs the model inputs, which
+    only `compute_loss` sees.
 
-    loss = loss_fct(lm_logits.view(-1, vocab_size), labels.reshape(-1))
-    if reduction == "sum":
-        loss = loss / num_items_in_batch
+    The teacher is fed the same encoder features and decoder prefix as the student, so
+    the penalty is a per-token KL between two aligned next-token distributions. Pointing
+    it at the checkpoint being fine-tuned makes the term a trust region: it starts at
+    exactly zero and grows only as the student drifts.
 
-    return loss
+    Label smoothing and the KL penalty are both applied during training only - eval loss
+    stays plain cross entropy so it can be compared across runs that configure them
+    differently. Track the regularized objective through `train/loss` and `train/kd_kl`.
+    """
+
+    def __init__(
+        self,
+        *args,
+        teacher_model=None,
+        kd_weight: float = 0.0,
+        kd_temperature: float = 1.0,
+        label_smoothing: float = 0.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.teacher_model = teacher_model
+        self.kd_weight = kd_weight
+        self.kd_temperature = kd_temperature
+        self.label_smoothing = label_smoothing
+        self._kd_kl_total = 0.0
+        self._kd_kl_steps = 0
+
+        if self.teacher_model is not None:
+            self.teacher_model.to(self.args.device)
+            self.teacher_model.eval()
+            self.teacher_model.requires_grad_(False)
+
+    def _transcription_loss(self, logits, labels, num_items_in_batch, label_smoothing):
+        # Until the Whisper model loss is updated to use the new Transfomers loss infrastruture,
+        # it suffers from  bug in how grad acc steps loss is calculated. This is a workaround.
+        # See https://huggingface.co/blog/gradient_accumulation
+        vocab_size = logits.shape[2]
+        reduction = "sum" if num_items_in_batch is not None else "mean"
+        loss_fct = torch.nn.CrossEntropyLoss(
+            reduction=reduction, label_smoothing=label_smoothing
+        )
+        # move labels to correct device to enable PP
+        labels = labels.to(logits.device)
+
+        loss = loss_fct(logits.view(-1, vocab_size), labels.reshape(-1))
+        if reduction == "sum":
+            loss = loss / num_items_in_batch
+
+        return loss
+
+    def _teacher_kl(self, student_logits, teacher_logits, labels):
+        """Mean per-token KL(teacher || student) over the tokens that carry loss.
+
+        Masking to the scored tokens keeps the padding and the prompt prefix - which are
+        already excluded from the cross entropy - from dominating the penalty.
+        """
+        scored = labels.to(student_logits.device) != -100
+        temperature = self.kd_temperature
+
+        student_log_probs = torch.nn.functional.log_softmax(
+            student_logits[scored].float() / temperature, dim=-1
+        )
+        teacher_log_probs = torch.nn.functional.log_softmax(
+            teacher_logits[scored].float() / temperature, dim=-1
+        )
+        kl = torch.nn.functional.kl_div(
+            student_log_probs, teacher_log_probs, log_target=True, reduction="batchmean"
+        )
+
+        # Hinton's T^2 keeps the distillation gradient scale comparable across temperatures
+        return (temperature**2) * kl
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        try:
+            outputs = model(**inputs)
+            # Both regularizers are training-only, so eval loss stays plain cross entropy
+            # and remains comparable across runs with different smoothing/KD settings.
+            loss = self._transcription_loss(
+                outputs.logits,
+                labels,
+                num_items_in_batch,
+                label_smoothing=self.label_smoothing if model.training else 0.0,
+            )
+
+            if self.teacher_model is not None and self.kd_weight > 0 and model.training:
+                with torch.no_grad():
+                    teacher_logits = self.teacher_model(**inputs).logits
+                kl = self._teacher_kl(outputs.logits, teacher_logits, labels)
+                self._kd_kl_total += kl.item()
+                self._kd_kl_steps += 1
+                loss = loss + self.kd_weight * kl
+        finally:
+            inputs["labels"] = labels
+
+        return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs, start_time=None):
+        # Surface the raw KL alongside the loss so drift from the teacher is visible
+        if self._kd_kl_steps:
+            logs["kd_kl"] = self._kd_kl_total / self._kd_kl_steps
+            self._kd_kl_total = 0.0
+            self._kd_kl_steps = 0
+        super().log(logs, start_time)
 
 
 def parse_arguments():
@@ -351,19 +440,48 @@ def parse_arguments():
     )
     parser.add_argument("--use_qlora", action="store_true", help="Use QLoRA for training")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Warmup ratio")
+    # Transformers gives warmup_steps precedence whenever it is > 0, which silently
+    # discarded warmup_ratio. Accept exactly one and translate it in main().
+    warmup_group = parser.add_mutually_exclusive_group()
+    warmup_group.add_argument(
+        "--warmup_ratio", type=float, help="Fraction of total training steps spent warming up (default: 0.1)"
+    )
     parser.add_argument("--num_train_epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument(
         "--max_steps", type=int, default=-1, help="How many steps to train for - overrides num_train_epochs"
     )
-    parser.add_argument("--warmup_steps", type=int, default=500, help="Number of warmup steps")
+    warmup_group.add_argument(
+        "--warmup_steps", type=int, help="Absolute number of warmup steps, instead of --warmup_ratio"
+    )
     parser.add_argument(
         "--lr_scheduler_type", type=str, default="constant_with_warmup", help="Learning rate scheduler type"
     )
     parser.add_argument(
         "--gradient_accumulation_steps", type=int, default=2, help="Number of gradient accumulation steps"
     )
-    parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay")
+    parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay (AdamW L2 regularization)")
+    parser.add_argument(
+        "--label_smoothing",
+        type=float,
+        default=0.0,
+        help="Label smoothing for the transcription cross entropy",
+    )
+    parser.add_argument(
+        "--kd_weight",
+        type=float,
+        default=0.0,
+        help="Weight of the KL penalty against a frozen teacher (0 disables distillation)",
+    )
+    parser.add_argument(
+        "--kd_teacher_model",
+        type=str,
+        default=None,
+        help="Teacher to regularize towards. Defaults to --model_name, which makes the "
+        "penalty a trust region around the checkpoint being fine-tuned",
+    )
+    parser.add_argument(
+        "--kd_temperature", type=float, default=1.0, help="Softmax temperature for the KL penalty"
+    )
     parser.add_argument(
         "--eval_steps", type=int, help="Number of steps between two evals, if not specified defaults to logging_steps."
     )
@@ -496,14 +614,33 @@ def main():
 
     model.generate = partial(model.generate, language=args.target_language, task="transcribe", use_cache=True)
 
+    # Exactly one warmup form reaches Transformers, so the other cannot silently win
+    if args.warmup_steps is not None:
+        warmup_steps, warmup_ratio = args.warmup_steps, 0.0
+    else:
+        warmup_steps, warmup_ratio = 0, 0.1 if args.warmup_ratio is None else args.warmup_ratio
+    print(f"Warmup: {f'{warmup_steps} steps' if warmup_steps else f'{warmup_ratio:.1%} of training'}")
+
+    teacher_model = None
+    if args.kd_weight > 0:
+        teacher_name = args.kd_teacher_model or args.model_name
+        print(f"Loading frozen KD teacher: {teacher_name} (weight={args.kd_weight}, T={args.kd_temperature})")
+        teacher_model = WhisperForConditionalGeneration.from_pretrained(
+            teacher_name, attn_implementation=args.attn_implementation
+        )
+        # No generation happens on the teacher - skip the cache it would otherwise build
+        teacher_model.config.use_cache = False
+    elif args.kd_teacher_model:
+        print("Ignoring --kd_teacher_model since --kd_weight is 0")
+
     training_args = Seq2SeqTrainingArguments(
         output_dir=args.output_model_name,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         lr_scheduler_type=args.lr_scheduler_type,
-        warmup_ratio=args.warmup_ratio,  # Overidden by warmup_steps - So cannot really use this?
-        warmup_steps=args.warmup_steps,
+        warmup_ratio=warmup_ratio,
+        warmup_steps=warmup_steps,
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_strategy="steps",
@@ -544,7 +681,7 @@ def main():
         average_tokens_across_devices=True,
     )
 
-    trainer = Seq2SeqTrainer(
+    trainer = WhisperDistillationTrainer(
         args=training_args,
         model=model,
         train_dataset=train_set,
@@ -552,7 +689,10 @@ def main():
         data_collator=data_collator,
         compute_metrics=lambda pred: compute_metrics(pred, processor, metric, normalizer),
         processing_class=processor,
-        compute_loss_func=compute_loss_func,
+        teacher_model=teacher_model,
+        kd_weight=args.kd_weight,
+        kd_temperature=args.kd_temperature,
+        label_smoothing=args.label_smoothing,
     )
 
     resume_from_checkpoint = False
