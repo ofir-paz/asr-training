@@ -23,3 +23,10 @@ config/
 
 # Local Tracker outputs
 wandb
+
+output_segmented*
+input_audio
+Marine_audio_with_transcripts
+.DS_Store
+*.wav
+*.mp3
