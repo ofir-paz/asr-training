@@ -30,3 +30,4 @@ Marine_audio_with_transcripts
 .DS_Store
 *.wav
 *.mp3
+noise_test_output

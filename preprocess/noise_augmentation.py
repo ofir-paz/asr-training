@@ -200,20 +200,20 @@ class NoiseAugmenter:
         1.0 disables it.
     """
 
-    noise_dir: str
+    noise_dir: str 
     target_sampling_rate: int
     apply_prob: float = 0.6
-    snr_db_range: tuple[float, float] = (0.0, 25.0)
+    snr_db_range: tuple[float, float] = (4.0, 25.0)
     num_noises_range: tuple[int, int] = (1, 1)
     gain_jitter_db: float = 3.0
-    burst_len_frac_range: tuple[float, float] = (0.85, 1.0)
-    coverage_frac_range: tuple[float, float] = (0.5, 0.8)
+    burst_len_frac_range: tuple[float, float] = (0.9, 1.0) # how much to use out of the noise clip
+    coverage_frac_range: tuple[float, float] = (0.5, 0.8) # how much of the signal would get pullted (calculted based of 0.5 to 0.8 percent of the time)
 
     time_stretch_range: Optional[tuple[float, float]] = (0.97, 1.03)
     pitch_shift_semitone_range: Optional[tuple[float, float]] = (-0.5, 0.5)
-    perturb_prob: float = 0.3
-    simulate_radio_channel: bool = False
-    radio_band_hz: tuple[float, float] = (300.0, 3400.0)
+    perturb_prob: float = 0.3 # the propability for stretch, and pitch should be low
+    simulate_radio_channel: bool = True
+    radio_band_hz: tuple[float, float] = (50.0, 4000.0)
     filter_signal_too: bool = False
     radio_clip_drive: float = 1.0
     library: NoiseLibrary = field(init=False, repr=False)
@@ -301,17 +301,15 @@ class NoiseAugmenter:
             segment = segment * (10 ** (gain_db / 20))
             mixed_noise += segment
             
-            # I am dropping the bandpass, since the noise is already resampled to 8khz and then to
-            #  16khz (applying some high filter) I don't want to apply low filter though. (cause in the ts we don't have one)
-            
+            # might should be dropped in the future, because the noise corpus is resampled twice -> 8khz -> 16khz        
             # if self.simulate_radio_channel:
             #     mixed_noise = _bandpass_filter(mixed_noise, self.target_sampling_rate, *self.radio_band_hz)
 
         mixed = mix_audio_at_snr(audio, mixed_noise, decision["snr_db"])
 
         if self.simulate_radio_channel:
-            # if self.filter_signal_too:
-            #     mixed = _bandpass_filter(mixed, self.target_sampling_rate, *self.radio_band_hz)
+            if self.filter_signal_too:
+                mixed = _bandpass_filter(mixed, self.target_sampling_rate, *self.radio_band_hz)
             if self.radio_clip_drive > 1.0:
                 mixed = _soft_clip(mixed, self.radio_clip_drive)
 

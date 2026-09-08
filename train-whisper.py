@@ -317,7 +317,52 @@ def parse_arguments():
     parser.add_argument("--run_name", help="Run name to report to the run tracker")
     parser.add_argument("--logging_steps", type=int, default=500, help="Number of step between each log")
 
+    pg = parser.add_argument_group("noise augmentation")
+    pg.add_argument(
+        "--noise_config",
+        type=str,
+        default=None,
+        metavar="YAML_PATH",
+        help="Path to a YAML file with noise augmentation settings. "
+             "Enables live noise augmentation during training (only works with --train_datasets, not --use_preprocessed). "
+             "See preprocess/noise_config.yaml for an annotated example.",
+    )
+    pg.add_argument(
+        "--noise_dir",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Override the noise_dir from --noise_config without editing the YAML.",
+    )
+    pg.add_argument(
+        "--noise_augmentation",
+        action="store_true",
+        default=False,
+        help="Enable live noise augmentation during training. Requires --noise_config.",
+    )
     return parser.parse_args()
+
+
+def _load_noise_config(yaml_path: str) -> dict:
+    """Load noise augmentation kwargs from a YAML file.
+
+    Keys can be written with or without the 'noise_' prefix — both are accepted.
+    Lists are converted to tuples. Defaults live in noise_config.yaml itself.
+    """
+    import yaml
+
+    with open(yaml_path) as f:
+        raw = yaml.safe_load(f) or {}
+
+    cfg = {}
+    for key, val in raw.items():
+        canonical = key if key.startswith("noise_") else f"noise_{key}"
+        cfg[canonical] = tuple(val) if isinstance(val, list) else val
+
+    if not cfg.get("noise_dir"):
+        raise ValueError("noise_config YAML must include 'noise_dir'")
+
+    return cfg
 
 
 def main():
@@ -330,6 +375,20 @@ def main():
         raise ValueError("Cannot use preprocessed data and save preprocessed data at the same time.")
 
     processor = WhisperProcessor.from_pretrained(args.model_name, language=args.target_language, task="transcribe")
+
+    noise_kwargs = {}
+    if args.noise_augmentation:
+        if not args.noise_config:
+            raise ValueError("--noise_augmentation requires --noise_config to also be set")
+        noise_kwargs = _load_noise_config(args.noise_config)
+        if args.noise_dir:
+            noise_kwargs["noise_dir"] = args.noise_dir
+        noise_kwargs["noise_augmentation"] = True
+        print(f"Noise augmentation enabled (config: {args.noise_config})")
+        print(f"  noise_dir: {noise_kwargs['noise_dir']}")
+    elif args.noise_dir:
+        raise ValueError("--noise_dir requires --noise_augmentation to also be set")
+
     preparator = DatasetPreparator(
         processor,
         proc_num=args.ds_processor_proc_num,
@@ -337,6 +396,7 @@ def main():
         condition_on_prev_sample_prob=args.include_prev_text_prob,
         inject_synthetic_timestamps=args.inject_synthetic_timestamps,
         audio_shift_augmentation=args.audio_shift_augmentation,
+        **noise_kwargs,
     )
 
     dataset_shuffle_seed = 745
