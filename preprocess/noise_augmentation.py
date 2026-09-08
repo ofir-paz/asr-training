@@ -87,19 +87,20 @@ def _loop_or_window(clip: NDArray[np.float32], length: int, rng: np.random.Gener
 def _place_bursts(
     clip: NDArray[np.float32],
     length: int,
-    num_bursts: int,
+    coverage_frac: float,
     burst_len_frac_range: tuple[float, float],
     rng: np.random.Generator,
 ) -> NDArray[np.float32]:
-    """Scatter `num_bursts` near-full-clip bursts at random positions across `length`,
-    silence everywhere else. Bursts may overlap each other (caller controls that via
-    num_bursts_range - keep it low, e.g. (1,2), to test overlap behavior first)."""
     out = np.zeros(length, dtype=np.float32)
     clip_len = clip.shape[-1]
+
+    max_slots = max(1, int(length // clip_len))          # e.g. 40//4 = 10
+    num_bursts = max(1, int(round(max_slots * coverage_frac)))  # e.g. round(10 * 0.8) = 8
+
     for _ in range(num_bursts):
         frac = float(rng.uniform(*burst_len_frac_range))
         burst_len = max(1, min(int(round(clip_len * frac)), length, clip_len))
-        burst = _loop_or_window(clip, burst_len, rng)  # near-full clip, slight random crop
+        burst = _loop_or_window(clip, burst_len, rng)
         start = int(rng.integers(0, length - burst_len + 1))
         out[start : start + burst_len] += burst
     return out
@@ -205,8 +206,8 @@ class NoiseAugmenter:
     snr_db_range: tuple[float, float] = (0.0, 25.0)
     num_noises_range: tuple[int, int] = (1, 1)
     gain_jitter_db: float = 3.0
-    num_bursts_range: tuple[int, int] = (1, 1)
     burst_len_frac_range: tuple[float, float] = (0.85, 1.0)
+    coverage_frac_range: tuple[float, float] = (0.5, 0.8)
 
     time_stretch_range: Optional[tuple[float, float]] = (0.97, 1.03)
     pitch_shift_semitone_range: Optional[tuple[float, float]] = (-0.5, 0.5)
@@ -252,7 +253,7 @@ class NoiseAugmenter:
         ]
 
         snr_db = float(rng.uniform(*self.snr_db_range))
-        num_bursts_list = [int(rng.integers(self.num_bursts_range[0], self.num_bursts_range[1] + 1)) for _ in range(num_noises)]
+        coverage_fracs = [float(rng.uniform(*self.coverage_frac_range)) for _ in range(num_noises)]
 
         return {
             "noise_indices": noise_indices, # pick the noises
@@ -261,7 +262,7 @@ class NoiseAugmenter:
             "time_stretch_factors": time_stretch_factors, #fasten the noise
             "pitch_shift_semitones": pitch_shift_semitones, # get a different pitch for the noise
             "snr_db": snr_db,
-            "num_bursts_list": num_bursts_list,
+            "coverage_fracs": coverage_fracs,
         }
 
     
@@ -273,13 +274,13 @@ class NoiseAugmenter:
         length = audio.shape[-1]
         mixed_noise = np.zeros(length, dtype=np.float32)
 
-        for idx, gain_db, offset_seed, stretch, pitch, num_bursts in zip(
+        for idx, gain_db, offset_seed, stretch, pitch, coverage_frac in zip(
             decision["noise_indices"],
             decision["gain_jitters_db"],
             decision["offset_seeds"],
             decision["time_stretch_factors"],
             decision["pitch_shift_semitones"],
-            decision["num_bursts_list"],
+            decision["coverage_fracs"],
         ):
             clip = self.library.clips[idx]
             local_rng = np.random.default_rng(offset_seed)
@@ -296,7 +297,7 @@ class NoiseAugmenter:
             else:
                 clip_for_bursts = clip
 
-            segment = _place_bursts(clip_for_bursts, length, num_bursts, self.burst_len_frac_range, local_rng)
+            segment = _place_bursts(clip_for_bursts, length, coverage_frac, self.burst_len_frac_range, local_rng)            
             segment = segment * (10 ** (gain_db / 20))
             mixed_noise += segment
             
