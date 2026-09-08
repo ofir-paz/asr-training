@@ -59,7 +59,7 @@ class DatasetPreparator:
         # Experimental
         inject_synthetic_timestamps=False,
         audio_shift_augmentation=False,
-        # Noise augmentation (on-the-fly, decided per-example like the shift augmentation above)
+        # Noise augmentation (decided per-example like the shift augmentation above)
         noise_augmentation=False,
         noise_dir: str = None,
         noise_apply_prob: float = 0.6,
@@ -70,9 +70,9 @@ class DatasetPreparator:
         noise_pitch_shift_semitone_range: tuple = (-0.5, 0.5),
         noise_perturb_prob: float = 0.3,
         noise_simulate_radio_channel: bool = False,
-        noise_radio_band_hz: tuple = (300.0, 3400.0),
-        noise_filter_signal_too: bool = False,
-        noise_radio_clip_drive: float = 1.0,
+        noise_radio_band_hz: tuple = (300.0, 3400.0), # not used also
+        noise_filter_signal_too: bool = False, # not used for now 
+        noise_radio_clip_drive: float = 1.0, # to simultate hitting the the cap
     ):
         if proc_num > 1:  # Parallel processing will not work in multi threaded env.
             torch.set_num_threads(1)

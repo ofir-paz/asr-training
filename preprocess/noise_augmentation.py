@@ -84,6 +84,26 @@ def _loop_or_window(clip: NDArray[np.float32], length: int, rng: np.random.Gener
     tiled = np.tile(rotated, reps)
     return tiled[:length]
 
+def _place_bursts(
+    clip: NDArray[np.float32],
+    length: int,
+    num_bursts: int,
+    burst_len_frac_range: tuple[float, float],
+    rng: np.random.Generator,
+) -> NDArray[np.float32]:
+    """Scatter `num_bursts` near-full-clip bursts at random positions across `length`,
+    silence everywhere else. Bursts may overlap each other (caller controls that via
+    num_bursts_range - keep it low, e.g. (1,2), to test overlap behavior first)."""
+    out = np.zeros(length, dtype=np.float32)
+    clip_len = clip.shape[-1]
+    for _ in range(num_bursts):
+        frac = float(rng.uniform(*burst_len_frac_range))
+        burst_len = max(1, min(int(round(clip_len * frac)), length, clip_len))
+        burst = _loop_or_window(clip, burst_len, rng)  # near-full clip, slight random crop
+        start = int(rng.integers(0, length - burst_len + 1))
+        out[start : start + burst_len] += burst
+    return out
+
 # scale the noise with the audio signal to hit some specific snr
 def mix_audio_at_snr(
     audio: NDArray[np.float32], noise: NDArray[np.float32], snr_db: float, prevent_clipping: bool = True
@@ -185,6 +205,9 @@ class NoiseAugmenter:
     snr_db_range: tuple[float, float] = (0.0, 25.0)
     num_noises_range: tuple[int, int] = (1, 1)
     gain_jitter_db: float = 3.0
+    num_bursts_range: tuple[int, int] = (1, 1)
+    burst_len_frac_range: tuple[float, float] = (0.85, 1.0)
+
     time_stretch_range: Optional[tuple[float, float]] = (0.97, 1.03)
     pitch_shift_semitone_range: Optional[tuple[float, float]] = (-0.5, 0.5)
     perturb_prob: float = 0.3
@@ -229,6 +252,7 @@ class NoiseAugmenter:
         ]
 
         snr_db = float(rng.uniform(*self.snr_db_range))
+        num_bursts_list = [int(rng.integers(self.num_bursts_range[0], self.num_bursts_range[1] + 1)) for _ in range(num_noises)]
 
         return {
             "noise_indices": noise_indices, # pick the noises
@@ -237,8 +261,10 @@ class NoiseAugmenter:
             "time_stretch_factors": time_stretch_factors, #fasten the noise
             "pitch_shift_semitones": pitch_shift_semitones, # get a different pitch for the noise
             "snr_db": snr_db,
+            "num_bursts_list": num_bursts_list,
         }
 
+    
     # ---- apply step --------------------------------------------------------
     def apply(self, audio: NDArray[np.float32], decision: Optional[dict]) -> NDArray[np.float32]:
         if decision is None:
@@ -247,39 +273,38 @@ class NoiseAugmenter:
         length = audio.shape[-1]
         mixed_noise = np.zeros(length, dtype=np.float32)
 
-        for idx, gain_db, offset_seed, stretch, pitch in zip(
+        for idx, gain_db, offset_seed, stretch, pitch, num_bursts in zip(
             decision["noise_indices"],
             decision["gain_jitters_db"],
             decision["offset_seeds"],
             decision["time_stretch_factors"],
             decision["pitch_shift_semitones"],
+            decision["num_bursts_list"],
         ):
             clip = self.library.clips[idx]
             local_rng = np.random.default_rng(offset_seed)
 
             if _HAS_LIBROSA and (stretch != 1.0 or pitch != 0.0):
-                # Perturb a slightly-longer-than-needed window first so post-stretch length
-                # still comfortably covers `length`, then window/trim to exact length after.
-                pre_len = int(np.ceil(length / max(stretch, 1e-3))) + 1
-                segment = _loop_or_window(clip, pre_len, local_rng)
+                clip_for_bursts = clip
                 if stretch != 1.0:
-                    segment = librosa.effects.time_stretch(segment, rate=stretch)
+                    clip_for_bursts = librosa.effects.time_stretch(clip_for_bursts, rate=stretch)
                 if pitch != 0.0:
-                    segment = librosa.effects.pitch_shift(
-                        segment, sr=self.target_sampling_rate, n_steps=pitch
+                    clip_for_bursts = librosa.effects.pitch_shift(
+                        clip_for_bursts, sr=self.target_sampling_rate, n_steps=pitch
                     )
-                segment = _loop_or_window(segment.astype(np.float32), length, local_rng)
+                clip_for_bursts = clip_for_bursts.astype(np.float32)
             else:
-                segment = _loop_or_window(clip, length, local_rng)
+                clip_for_bursts = clip
 
+            segment = _place_bursts(clip_for_bursts, length, num_bursts, self.burst_len_frac_range, local_rng)
             segment = segment * (10 ** (gain_db / 20))
             mixed_noise += segment
-
-        # I am dropping the bandpass, since the noise is already resampled to 8khz and then to
-        #  16khz (applying some high filter) I don't want to apply low filter though. (cause in the ts we don't have one)
-        
-        # if self.simulate_radio_channel:
-        #     mixed_noise = _bandpass_filter(mixed_noise, self.target_sampling_rate, *self.radio_band_hz)
+            
+            # I am dropping the bandpass, since the noise is already resampled to 8khz and then to
+            #  16khz (applying some high filter) I don't want to apply low filter though. (cause in the ts we don't have one)
+            
+            # if self.simulate_radio_channel:
+            #     mixed_noise = _bandpass_filter(mixed_noise, self.target_sampling_rate, *self.radio_band_hz)
 
         mixed = mix_audio_at_snr(audio, mixed_noise, decision["snr_db"])
 
