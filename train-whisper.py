@@ -373,12 +373,23 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
         # train/loss folds together the smoothed cross entropy and the KL penalty, which
         # leaves a long unattended run undiagnosable - a rising total could be either the
         # model fitting worse or the teacher penalty taking over. Report both terms.
+        # compute_loss normalizes the cross entropy by the token count of the WHOLE
+        # accumulation window, so its per-micro-batch values sum to one true per-token loss
+        # per optimizer step. Averaging them over micro-batches would report that value
+        # divided by the accumulation setting, so two runs that fit identically would print
+        # different numbers purely because their accumulation differs. Scale back to per
+        # optimizer step. The KL is already a per-token mean over its own micro-batch and
+        # needs no such correction - which is also why kd_share has to be formed from the
+        # corrected cross entropy, not the raw running total.
         if self._loss_steps:
-            logs["ce"] = self._ce_total / self._loss_steps
+            optimizer_steps = self._loss_steps / self.args.gradient_accumulation_steps
+            cross_entropy = self._ce_total / optimizer_steps
+            logs["ce"] = cross_entropy
             if self.teacher_model is not None and self.kd_weight > 0:
-                logs["kd_kl"] = self._kd_kl_total / self._loss_steps
-                logs["kd_share"] = (self.kd_weight * self._kd_kl_total) / max(
-                    self._ce_total + self.kd_weight * self._kd_kl_total, 1e-12
+                kl = self._kd_kl_total / self._loss_steps
+                logs["kd_kl"] = kl
+                logs["kd_share"] = (self.kd_weight * kl) / max(
+                    cross_entropy + self.kd_weight * kl, 1e-12
                 )
             self._ce_total = 0.0
             self._kd_kl_total = 0.0
