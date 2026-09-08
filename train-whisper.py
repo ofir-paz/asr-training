@@ -272,6 +272,17 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
         self.kd_weight = kd_weight
         self.kd_temperature = kd_temperature
         self.label_smoothing = label_smoothing
+        # Transformers halves-again the loss: training_step divides by
+        # gradient_accumulation_steps unless the model takes loss kwargs or a
+        # compute_loss_func was supplied. Our compute_loss already normalizes by
+        # num_items_in_batch, which counts the tokens of the WHOLE accumulation window, so
+        # the micro-batch losses already sum to the correct full-batch loss. Dividing again
+        # scales every gradient by 1/accum - silently training at lr/accum. The original
+        # code escaped this by passing compute_loss_func; a Trainer subclass has to suppress
+        # it here. The flag's only other uses are inside Trainer.compute_loss, which this
+        # class overrides in full, so nothing else changes.
+        self.model_accepts_loss_kwargs = True
+
         self._ce_total = 0.0
         self._kd_kl_total = 0.0
         self._loss_steps = 0
