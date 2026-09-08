@@ -1,33 +1,7 @@
-# Python
-__pycache__
-
-# Visual Studio Code
-.vscode
-
-# Ignore python virtual env folders
 .venv
-env
-venv
-
-# Data Folders
-data
-downloads
-local_models
-local_datasets
-
-# Temporary Scrips
-tmp_*.py
-
-# Local Configuration files
-config/
-
-# Local Tracker outputs
-wandb
-
-output_segmented*
-input_audio
-Marine_audio_with_transcripts
+audio-set
 .DS_Store
-*.wav
-*.mp3
-noise_test_output
+preprocess/noise_test_output
+__pycache__
+wandb
+.gitignore
