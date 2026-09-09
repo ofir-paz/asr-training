@@ -7,7 +7,7 @@
 # ── Required ──────────────────────────────────────────────────────────────────
 
 # Directory containing your noise clips (wav/flac/mp3/ogg/m4a, subdirs ok)
-noise_dir: /Users/USER/Desktop/asr-training/audio-set/noise_input_16khz
+noise_dir: /Users/Shared/asr/noise_input_16khz
 
 # ── Mixing ────────────────────────────────────────────────────────────────────
 
