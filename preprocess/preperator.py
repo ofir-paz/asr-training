@@ -64,17 +64,13 @@ class DatasetPreparator:
         noise_dir: str = None,
         noise_apply_prob: float = 0.6,
         noise_snr_db_range: tuple = (4.0, 25.0),
-        noise_num_noises_range: tuple = (1, 1),
         noise_gain_jitter_db: float = 3.0,
         noise_time_stretch_range: tuple = (0.97, 1.03),
         noise_pitch_shift_semitone_range: tuple = (-0.5, 0.5),
         noise_perturb_prob: float = 0.3,
         noise_simulate_radio_channel: bool = False,
-        noise_radio_band_hz: tuple = (50.0, 4000.0), # not used also
-        noise_filter_signal_too: bool = False, # not used for now 
-        noise_radio_clip_drive: float = 1.0, # to simultate hitting the the cap
-        noise_coverage_frac_range: tuple = (0.5, 0.8),
-        noise_burst_len_frac_range: tuple = (0.9, 1.0),
+        noise_radio_band_hz: tuple = (50.0, 4000.0),
+        noise_radio_clip_drive: float = 1.0,
         # Resample augmentation
         resample_augmentation: bool = False,
         resample_target_hz: int = 8000,
@@ -130,17 +126,13 @@ class DatasetPreparator:
                 target_sampling_rate=self.target_sampling_rate,
                 apply_prob=noise_apply_prob,
                 snr_db_range=noise_snr_db_range,
-                num_noises_range=noise_num_noises_range,
                 gain_jitter_db=noise_gain_jitter_db,
                 time_stretch_range=noise_time_stretch_range,
                 pitch_shift_semitone_range=noise_pitch_shift_semitone_range,
                 perturb_prob=noise_perturb_prob,
                 simulate_radio_channel=noise_simulate_radio_channel,
                 radio_band_hz=noise_radio_band_hz,
-                filter_signal_too=noise_filter_signal_too,
                 radio_clip_drive=noise_radio_clip_drive,
-                coverage_frac_range=noise_coverage_frac_range,
-                burst_len_frac_range=noise_burst_len_frac_range,
             )
 
         # Prepare the output features - to ensure optimal storage during mapping (uses disk cache for mapped content)
