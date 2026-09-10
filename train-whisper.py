@@ -431,6 +431,23 @@ def parse_arguments():
         action="store_true",
     )
     parser.add_argument(
+        "--resample_augmentation",
+        help="Simulate low-quality audio by downsampling to --resample_target_hz and back",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--resample_target_hz",
+        type=int,
+        default=8000,
+        help="Target sample rate for the resample augmentation round-trip (default: 8000)",
+    )
+    parser.add_argument(
+        "--resample_prob",
+        type=float,
+        default=0.6,
+        help="Probability of applying resample augmentation to each sample (default: 0.6)",
+    )
+    parser.add_argument(
         "--use_preprocessed",
         nargs="+",
         help="Dataset name to load preprocessed data from (either local path or remote dataset)",
@@ -625,6 +642,9 @@ def main():
         condition_on_prev_sample_prob=args.include_prev_text_prob,
         inject_synthetic_timestamps=args.inject_synthetic_timestamps,
         audio_shift_augmentation=args.audio_shift_augmentation,
+        resample_augmentation=args.resample_augmentation,
+        resample_target_hz=args.resample_target_hz,
+        resample_prob=args.resample_prob,
         **noise_kwargs,
     )
 

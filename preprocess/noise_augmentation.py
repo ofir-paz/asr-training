@@ -105,20 +105,19 @@ def _place_bursts(
         out[start : start + burst_len] += burst
     return out
 
-# scale the noise with the audio signal to hit some specific snr
+# scale the noise with the audio signal to hit some specific snr.
+# Delegates SNR scaling to torchaudio.functional.add_noise (power-based,
+# tested, GPU-capable) and keeps only the clipping guard on top.
 def mix_audio_at_snr(
     audio: NDArray[np.float32], noise: NDArray[np.float32], snr_db: float, prevent_clipping: bool = True
 ) -> NDArray[np.float32]:
     """Mix `noise` into `audio` scaled so the result hits `snr_db` (signal RMS vs noise RMS)."""
-    audio_rms = _rms(audio)
-    noise_rms = _rms(noise)
-
-    if noise_rms < 1e-8 or audio_rms < 1e-8:
+    if _rms(noise) < 1e-8 or _rms(audio) < 1e-8:
         return audio  # nothing sensible to mix (silent clip / silent audio)
 
-    target_noise_rms = audio_rms / (10 ** (snr_db / 20))
-    scaled_noise = noise * (target_noise_rms / noise_rms)
-    mixed = audio + scaled_noise
+    a = torch.from_numpy(audio).unsqueeze(0)          # (1, T)
+    n = torch.from_numpy(noise).unsqueeze(0)          # (1, T)
+    mixed = torchaudio.functional.add_noise(a, n, torch.tensor([snr_db])).squeeze(0).numpy()
 
     if prevent_clipping:
         peak = np.max(np.abs(mixed))

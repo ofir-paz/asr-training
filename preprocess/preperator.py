@@ -13,7 +13,7 @@ from scipy.stats import beta
 from torchaudio.transforms import Resample
 from transformers import BatchFeature, WhisperProcessor
 
-from preprocess.augmentation import shift_audio_forward
+from preprocess.augmentation import shift_audio_forward, resample_augment
 from preprocess.noise_augmentation import NoiseAugmenter
 
 # This is defined as part of the model config
@@ -75,6 +75,10 @@ class DatasetPreparator:
         noise_radio_clip_drive: float = 1.0, # to simultate hitting the the cap
         noise_coverage_frac_range: tuple = (0.5, 0.8),
         noise_burst_len_frac_range: tuple = (0.9, 1.0),
+        # Resample augmentation
+        resample_augmentation: bool = False,
+        resample_target_hz: int = 8000,
+        resample_prob: float = 0.6,
     ):
         if proc_num > 1:  # Parallel processing will not work in multi threaded env.
             torch.set_num_threads(1)
@@ -108,6 +112,10 @@ class DatasetPreparator:
         self.inject_synthetic_timestamps = inject_synthetic_timestamps
         self.audio_shift_augmentation = audio_shift_augmentation
         self.max_shifted_audio_ends_at = 29.6
+        
+        self.resample_augmentation = resample_augmentation
+        self.resample_target_hz = resample_target_hz
+        self.resample_prob = resample_prob
 
         self.noise_augmentation = noise_augmentation
         self.noise_augmenter = None
@@ -216,6 +224,12 @@ class DatasetPreparator:
         else:
             ancillary_features["noise_augmentation"] = None
 
+        # Decide resample augmentation (roll once here so the decision is reproducible).
+        if self.resample_augmentation:
+            ancillary_features["resample_augmentation"] = self.seed.random() < self.resample_prob
+        else:
+            ancillary_features["resample_augmentation"] = False
+
     def _prepare_example_audio(self, example, ancillary_features, result_example: BatchFeature) -> None:
         audio = example["audio"]
         example_audio_shift_augmentation = ancillary_features["audio_shift_augmentation"]
@@ -232,6 +246,11 @@ class DatasetPreparator:
         if example_audio_shift_augmentation > 0:
             resampled_audio_array = shift_audio_forward(
                 resampled_audio_array, example_audio_shift_augmentation, target_sampling_rate
+            )
+
+        if ancillary_features.get("resample_augmentation"):
+            resampled_audio_array = resample_augment(
+                resampled_audio_array, target_sampling_rate, self.resample_target_hz
             )
 
         if self.noise_augmenter is not None:
