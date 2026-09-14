@@ -117,16 +117,26 @@ def snr_target_rms(reference_rms, snr_db: float):
 def mix_audio_at_snr(
     audio: NDArray[np.float32], noise: NDArray[np.float32], snr_db: float, prevent_clipping: bool = True
 ) -> NDArray[np.float32]:
-    """Mix `noise` into `audio` scaled so the result hits `snr_db` (signal RMS vs noise RMS)."""
+    """Mix `noise` into `audio` scaled so the result hits `snr_db` (signal RMS vs noise RMS).
+
+    The actual scaling is delegated to torchaudio.functional.add_noise (torchaudio is
+    already a hard dependency here, via NoiseLibrary's load/resample) rather than
+    re-deriving the dB->ratio math by hand: for equal-length arrays its
+    a = sqrt(||x||^2/||n||^2 * 10^(-SNR/10)) reduces to exactly
+    (audio_rms/noise_rms) * 10^(-snr_db/20) - the same formula this function used to
+    compute directly (verified numerically equal at float32 precision). What's kept here
+    is project policy torchaudio's function doesn't decide for you: skip mixing into a
+    near-silent clip, and prevent post-mix clipping.
+    """
     audio_rms = _rms(audio)
     noise_rms = _rms(noise)
 
     if noise_rms < 1e-8 or audio_rms < 1e-8:
         return audio  # nothing sensible to mix (silent clip / silent audio)
 
-    target_noise_rms = snr_target_rms(audio_rms, snr_db)
-    scaled_noise = noise * (target_noise_rms / noise_rms)
-    mixed = audio + scaled_noise
+    mixed = torchaudio.functional.add_noise(
+        torch.from_numpy(audio), torch.from_numpy(noise), torch.tensor(float(snr_db))
+    ).numpy()
 
     if prevent_clipping:
         peak = np.max(np.abs(mixed))
