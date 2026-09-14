@@ -156,6 +156,35 @@ def load_datasets(dataset_specs):
     return datasets
 
 
+def _whisper_log_mel_to_power(log_mel: torch.Tensor) -> torch.Tensor:
+    """Inverts WhisperFeatureExtractor's log-mel normalization: stored = (log10(mel)+4)/4,
+    so log10(mel) = stored*4-4. Exact and lossless (just undoing a log10 curve) - not a
+    spectral/waveform reconstruction.
+    """
+    return 10.0 ** (log_mel * 4.0 - 4.0)
+
+
+def _whisper_power_to_log_mel(power: torch.Tensor) -> torch.Tensor:
+    """Re-applies WhisperFeatureExtractor's own clamp/log10/dynamic-range-clip/normalize
+    sequence to linear mel power, the exact inverse of _whisper_log_mel_to_power.
+    """
+    log10_power = torch.log10(torch.clamp(power, min=1e-10))
+    log10_power = torch.maximum(log10_power, log10_power.max() - 8.0)
+    return (log10_power + 4.0) / 4.0
+
+
+def _mel_power_rms(power: torch.Tensor) -> torch.Tensor:
+    """A 'loudness' proxy for an already-power (not amplitude) mel array: sqrt(mean(power)).
+
+    Deliberately NOT preprocess.noise_augmentation._rms's sqrt(mean(x**2)) - that formula
+    is for raw waveform amplitude samples; squaring an already-squared power value here
+    would be wrong. This is an approximation of true waveform RMS (see
+    NOISE_AUGMENTATION_AUDIT.md), used consistently everywhere this file needs a
+    power-domain SNR reference.
+    """
+    return torch.sqrt(torch.mean(power) + 1e-12)
+
+
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
@@ -208,13 +237,11 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         from preprocess.augmentation import apply_resample_mel
 
-        signal_power = 10.0 ** (base_features * 4.0 - 4.0)
+        signal_power = _whisper_log_mel_to_power(base_features)
         resampled_power = apply_resample_mel(
             signal_power, self.processor.feature_extractor.sampling_rate, self.resample_target_hz
         )
-        log10_power = torch.log10(torch.clamp(resampled_power, min=1e-10))
-        log10_power = torch.maximum(log10_power, log10_power.max() - 8.0)
-        return (log10_power + 4.0) / 4.0
+        return _whisper_power_to_log_mel(resampled_power)
 
     def _mix_mel_noise(self, base_features: torch.Tensor, pad_amount: int) -> torch.Tensor:
         """Mixes noise directly in the linear mel-spectrogram space for fast on-the-fly augmentation.
@@ -263,21 +290,18 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         noise_features = noise_features[:, :feat_len]
 
         # Convert log-mel back to linear mel power.
-        # Whisper log-mel is (log10(mel) + 4) / 4 -> log10(mel) = feat * 4 - 4
-        signal_power = 10.0 ** (base_features * 4.0 - 4.0)
-        noise_power = 10.0 ** (noise_features * 4.0 - 4.0)
+        signal_power = _whisper_log_mel_to_power(base_features)
+        noise_power = _whisper_log_mel_to_power(noise_features)
 
-        signal_rms = torch.sqrt(torch.mean(signal_power) + 1e-12)
-        noise_rms = torch.sqrt(torch.mean(noise_power) + 1e-12)
+        signal_rms = _mel_power_rms(signal_power)
+        noise_rms = _mel_power_rms(noise_power)
 
         snr_db = noise_decision["snr_db"]
         target_noise_rms = snr_target_rms(signal_rms, snr_db)
         scaled_noise_power = noise_power * ((target_noise_rms / noise_rms) ** 2)
 
         mixed_power = signal_power + scaled_noise_power
-        mixed_log10 = torch.log10(torch.clamp(mixed_power, min=1e-10))
-        mixed_log10 = torch.maximum(mixed_log10, mixed_log10.max() - 8.0)
-        mixed_features = (mixed_log10 + 4.0) / 4.0
+        mixed_features = _whisper_power_to_log_mel(mixed_power)
 
         noise_names = [self.noise_augmenter.library.file_paths[j].name for j in noise_decision["noise_indices"]]
         logger.debug(
@@ -286,7 +310,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
             ", ".join(noise_names),
             snr_db,
             signal_rms.item(),
-            torch.sqrt(torch.mean(mixed_power)).item(),
+            _mel_power_rms(mixed_power).item(),
         )
 
         return mixed_features

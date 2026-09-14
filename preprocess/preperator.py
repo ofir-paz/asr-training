@@ -16,7 +16,7 @@ from torchaudio.transforms import Resample
 from transformers import BatchFeature, WhisperProcessor
 
 from preprocess.augmentation import shift_audio_forward, resample_augment
-from preprocess.noise_augmentation import NoiseAugmenter
+from preprocess.noise_augmentation import NoiseAugmenter, _rms
 
 logger = logging.getLogger(__name__)
 
@@ -278,9 +278,9 @@ class DatasetPreparator:
         if self.noise_augmenter is not None:
             noise_decision = ancillary_features.get("noise_augmentation")
             if noise_decision is not None:
-                rms_before = float(np.sqrt(np.mean(np.square(resampled_audio_array)) + 1e-12))
+                rms_before = _rms(resampled_audio_array)
                 resampled_audio_array = self.noise_augmenter.apply(resampled_audio_array, noise_decision)
-                rms_after = float(np.sqrt(np.mean(np.square(resampled_audio_array)) + 1e-12))
+                rms_after = _rms(resampled_audio_array)
                 logger.debug(
                     "Noise augmentation APPLIED | RMS before: %.5f → after: %.5f (SNR target: %.2f dB)",
                     rms_before,
