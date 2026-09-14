@@ -57,3 +57,46 @@ def resample_augment(audio: NDArray[np.float32], sample_rate: int, target_hz: in
     down = ta_f.resample(t, sample_rate, target_hz)       # (1, T_low)
     up   = ta_f.resample(down, target_hz, sample_rate)    # (1, T)  — same length as input
     return up.squeeze(0).numpy().astype(audio.dtype)
+
+
+def resample_mel_cutoff_bin(n_mels: int, sample_rate: int, target_hz: int) -> int:
+    """Index of the first mel bin whose center frequency exceeds target_hz's Nyquist -
+    i.e. roughly where resample_augment()'s downsample+upsample round trip would start
+    suppressing content, mapped onto mel-bin space instead of raw samples.
+
+    Uses librosa.mel_frequencies (the same slaney-scale formula Whisper's own feature
+    extractor builds its filterbank from) rather than re-deriving mel-bin center
+    frequencies by hand. Verified against WhisperFeatureExtractor's actual mel_filters
+    matrix: for the default n_mels=80/16kHz config the two agree exactly on the cutoff
+    bin for an 8kHz target (bin 62); center-frequency estimates differ by a few tens of
+    Hz through most of the range and up to ~300Hz at the very top bins, where each mel
+    bin already spans a wide frequency range - acceptable for a bin-selection cutoff.
+    """
+    import librosa
+
+    freqs = librosa.mel_frequencies(n_mels=n_mels, fmin=0.0, fmax=sample_rate / 2)
+    nyquist = target_hz / 2
+    above = np.nonzero(freqs > nyquist)[0]
+    return int(above[0]) if above.size else n_mels
+
+
+def apply_resample_mel(mel_power: torch.Tensor, sample_rate: int, target_hz: int) -> torch.Tensor:
+    """Approximates resample_augment()'s bandwidth-limiting effect directly on linear
+    mel power, by zeroing mel bins above the target rate's Nyquist - for use where only
+    mel features are available (no raw waveform to actually resample), analogous to how
+    the live noise collator mixes in mel-power space instead of reconstructing audio.
+
+    A real anti-aliasing filter has a smooth transition band rather than a hard cutoff,
+    so this is an approximation of the dominant effect (content above the cutoff is
+    suppressed), not a bit-exact match to resample_augment()'s waveform-domain result.
+    """
+    if sample_rate <= target_hz:
+        return mel_power  # nothing to do, mirrors resample_augment's own guard
+
+    cutoff = resample_mel_cutoff_bin(mel_power.shape[0], sample_rate, target_hz)
+    if cutoff >= mel_power.shape[0]:
+        return mel_power
+
+    out = mel_power.clone()
+    out[cutoff:, :] = 0.0
+    return out

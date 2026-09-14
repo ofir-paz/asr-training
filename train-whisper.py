@@ -7,7 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Dict, List, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 logging.basicConfig(
     level=logging.INFO,
@@ -161,6 +161,13 @@ class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
     decoder_start_token_id: int
     noise_augmenter: Any = None
+    # Mirrors noise_augmenter's baked-vs-live duality: --resample_augmentation always
+    # bakes the round trip into DatasetPreparator's output; when --use_preprocessed is
+    # also set there's no raw audio left to bake into at collation time, so this applies
+    # the same probability live, approximated in mel-space instead (see _resample_mel).
+    # None disables it (the default, and always the case for the eval collator).
+    resample_prob: Optional[float] = None
+    resample_target_hz: int = 8000
 
     def __post_init__(self):
         augmenter = self.noise_augmenter
@@ -185,6 +192,29 @@ class DataCollatorSpeechSeq2SeqWithPadding:
                 "--use_preprocessed).",
                 " and ".join(ignored),
             )
+
+    def _resample_mel(self, base_features: torch.Tensor) -> torch.Tensor:
+        """Live counterpart of DatasetPreparator's --resample_augmentation: approximates
+        the downsample+upsample bandwidth-limiting round trip by zeroing mel bins above
+        the target rate's Nyquist (see preprocess.augmentation.apply_resample_mel) rather
+        than reconstructing a waveform to actually resample - there's no raw waveform to
+        round-trip here, only mel features, and unlike noise (an external signal we
+        synthesize from scratch) this modifies the speech's own mel content directly.
+        """
+        if self.resample_prob is None:
+            return base_features
+        if np.random.default_rng().random() >= self.resample_prob:
+            return base_features
+
+        from preprocess.augmentation import apply_resample_mel
+
+        signal_power = 10.0 ** (base_features * 4.0 - 4.0)
+        resampled_power = apply_resample_mel(
+            signal_power, self.processor.feature_extractor.sampling_rate, self.resample_target_hz
+        )
+        log10_power = torch.log10(torch.clamp(resampled_power, min=1e-10))
+        log10_power = torch.maximum(log10_power, log10_power.max() - 8.0)
+        return (log10_power + 4.0) / 4.0
 
     def _mix_mel_noise(self, base_features: torch.Tensor, pad_amount: int) -> torch.Tensor:
         """Mixes noise directly in the linear mel-spectrogram space for fast on-the-fly augmentation.
@@ -267,8 +297,11 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         for feature in features:
             pad_amount = feature.get("pad_amount", 0)
             base_features = torch.tensor(feature["input_features"])  # (d, feat_len)
-            
-            # Apply on-the-fly mel-space mixing
+
+            # Apply on-the-fly mel-space augmentation. Order mirrors DatasetPreparator's
+            # baked path (shift -> resample -> noise): bandwidth-limit the channel first,
+            # then add noise on top of the degraded signal.
+            base_features = self._resample_mel(base_features)
             base_features = self._mix_mel_noise(base_features, pad_amount)
 
             if pad_amount > 0:
@@ -608,12 +641,12 @@ def parse_arguments():
         "--output_model_name",
         default=None,
         help="Name of the fine-tuned model to generate. Also used as the run tracker (e.g. "
-        "wandb) run name, so a run is always trivially matched to its local output dir/"
-        "checkpoints - there is no separate --run_name. If omitted, a name is generated "
-        "from the run's hyperparameters (e.g. 'lv3-mix-na-b32-kd0.1'). Either way, if that "
-        "name already exists as a local output dir, '_2', '_3', etc. is appended rather "
-        "than overwriting it - unless --resume_from_checkpoint is set, in which case the "
-        "name is used as-is so resuming finds the existing checkpoints.",
+        "wandb) run name (--run_name is a deprecated no-op, see its help), so a run is "
+        "always trivially matched to its local output dir/checkpoints. If omitted, a name "
+        "is generated from the run's hyperparameters (e.g. 'lv3-mix-na-b32-kd0.1'). Either "
+        "way, if that name already exists as a local output dir, '_2', '_3', etc. is "
+        "appended rather than overwriting it - unless --resume_from_checkpoint is set, in "
+        "which case the name is used as-is so resuming finds the existing checkpoints.",
     )
     parser.add_argument("--hf_org_name", default="ivrit-ai", help="Name of HF Org to push the model to")
     parser.add_argument("--skip_push_to_hub", action="store_true", help="Don't push result model to hub")
@@ -717,6 +750,14 @@ def parse_arguments():
 
     parser.add_argument(
         "--no_report", action="store_true", help="Disable reporting to run trackers (e.g. wandb)."
+    )
+    parser.add_argument(
+        "--run_name",
+        default=None,
+        help="Deprecated, accepted for backward compatibility only: run_name always mirrors "
+        "--output_model_name now (see its help), so this has no effect. Kept as a no-op flag "
+        "so older commands that pass it (typically set equal to --output_model_name) don't "
+        "fail to parse.",
     )
     parser.add_argument("--logging_steps", type=int, default=500, help="Number of step between each log")
 
@@ -931,31 +972,47 @@ def main():
         if deduped != args.output_model_name:
             print(f"Output dir '{args.output_model_name}' already exists, using '{deduped}' instead")
             args.output_model_name = deduped
-    # Always kept identical to output_model_name (no separate --run_name) so the wandb
-    # run is trivially matched to the local output dir/checkpoints it corresponds to.
+    # Always kept identical to output_model_name (--run_name is accepted but a no-op, see
+    # its help) so the wandb run is trivially matched to the local output dir/checkpoints
+    # it corresponds to.
+    if args.run_name is not None and args.run_name != args.output_model_name:
+        print(
+            f"--run_name '{args.run_name}' is ignored (deprecated, no-op) - using "
+            f"'{args.output_model_name}' for both the output dir and the wandb run name."
+        )
     args.run_name = args.output_model_name
 
     _init_run_tracking(args, noise_kwargs)
 
     decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
     train_noise_augmenter = preparator.noise_augmenter if args.use_preprocessed else None
+    # Same baked-vs-live duality as noise: with --train_datasets, resample augmentation is
+    # already baked into the dataset by DatasetPreparator, so it must NOT also run live here
+    # (that would double-apply it); with --use_preprocessed there's nothing baked in, so the
+    # live mel-domain approximation is what actually delivers --resample_augmentation.
+    train_resample_prob = (
+        args.resample_prob if (args.use_preprocessed and args.resample_augmentation) else None
+    )
 
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(
         processor=processor,
         decoder_start_token_id=decoder_start_token_id,
         noise_augmenter=train_noise_augmenter,
+        resample_prob=train_resample_prob,
+        resample_target_hz=args.resample_target_hz,
     )
-    # Eval always gets the noise-free collator, even when training uses on-the-fly
-    # noise augmentation - otherwise every eval pass measures against a freshly and
-    # randomly re-noised eval set, which makes WER/loss incomparable across evals and
-    # undermines checkpoint selection / early-stopping decisions.
+    # Eval always gets the clean collator, even when training uses on-the-fly noise/resample
+    # augmentation - otherwise every eval pass measures against a freshly and randomly
+    # re-augmented eval set, which makes WER/loss incomparable across evals and undermines
+    # checkpoint selection / early-stopping decisions.
     eval_data_collator = (
         DataCollatorSpeechSeq2SeqWithPadding(
             processor=processor,
             decoder_start_token_id=decoder_start_token_id,
             noise_augmenter=None,
+            resample_prob=None,
         )
-        if train_noise_augmenter is not None
+        if (train_noise_augmenter is not None or train_resample_prob is not None)
         else None
     )
 

@@ -43,7 +43,16 @@ _AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".ogg", ".m4a")
 
 
 def _rms(x: NDArray[np.float32]) -> float:
+    # The +1e-12 keeps this safe to use as a division denominator (never exactly 0), but
+    # it also means _rms() can never return less than sqrt(1e-12) = 1e-6 - callers that
+    # threshold this to detect near-silence must compare against _SILENCE_RMS_THRESHOLD
+    # (set above that floor), not an arbitrarily smaller value that could never trigger.
     return float(np.sqrt(np.mean(np.square(x)) + 1e-12))
+
+
+# Must stay above _rms()'s 1e-6 floor (see above) or "is this near-silent" checks against
+# it can never fire, no matter how quiet the input actually is.
+_SILENCE_RMS_THRESHOLD = 2e-6
 
 # not used corrently (because I resample twice.)
 def _bandpass_filter(audio: NDArray[np.float32], sample_rate: int, low_hz: float, high_hz: float, order: int = 4) -> NDArray[np.float32]:
@@ -131,7 +140,7 @@ def mix_audio_at_snr(
     audio_rms = _rms(audio)
     noise_rms = _rms(noise)
 
-    if noise_rms < 1e-8 or audio_rms < 1e-8:
+    if noise_rms < _SILENCE_RMS_THRESHOLD or audio_rms < _SILENCE_RMS_THRESHOLD:
         return audio  # nothing sensible to mix (silent clip / silent audio)
 
     mixed = torchaudio.functional.add_noise(
@@ -215,7 +224,7 @@ class NoiseLibrary:
             if sr != target_sampling_rate:
                 waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sampling_rate)(waveform)
             clip = waveform.squeeze(0).numpy().astype(np.float32)
-            if clip.size == 0 or _rms(clip) < 1e-8:
+            if clip.size == 0 or _rms(clip) < _SILENCE_RMS_THRESHOLD:
                 warnings.warn(f"Noise clip appears silent/empty, skipping: {path}")
                 continue
             self.clips.append(clip)
