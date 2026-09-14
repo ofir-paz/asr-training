@@ -16,6 +16,7 @@ soundfile
 torch
 torchaudio
 transformers==4.48.1
+wandb
 openai
 python-dotenv
 retry

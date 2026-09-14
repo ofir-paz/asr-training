@@ -3,6 +3,7 @@
 
 import argparse
 import logging
+import os
 import re
 from dataclasses import dataclass
 from functools import partial
@@ -39,6 +40,7 @@ from preprocess.preperator import (
     process_datasets,
     whisper_max_target_positions,
 )
+from run_naming import dedupe_name, generate_run_name, local_dir_exists
 
 # Split on : but allow : inside [] for the HF split slicing syntax
 # https://huggingface.co/docs/datasets/loading#slice-splits
@@ -160,44 +162,69 @@ class DataCollatorSpeechSeq2SeqWithPadding:
     decoder_start_token_id: int
     noise_augmenter: Any = None
 
+    def __post_init__(self):
+        augmenter = self.noise_augmenter
+        if augmenter is None:
+            return
+        # These are waveform-domain effects (nonlinear soft-clip / filtering of the mixed
+        # signal); _mix_mel_noise only has access to mel features, not a raw waveform, so
+        # it cannot honor them. Warn loudly instead of silently dropping the config - this
+        # only matters for the live (--use_preprocessed) noise path; the baked
+        # (--train_datasets) path applies them in NoiseAugmenter.apply() as configured.
+        ignored = []
+        if augmenter.simulate_radio_channel and augmenter.filter_signal_too:
+            ignored.append("filter_signal_too")
+        if augmenter.simulate_radio_channel and augmenter.radio_clip_drive > 1.0:
+            ignored.append("radio_clip_drive")
+        if ignored:
+            logger.warning(
+                "[DataCollator] noise config sets %s, but the live/mel-domain noise "
+                "collator cannot apply waveform-domain radio-channel effects - only "
+                "SNR-based mixing will happen at train time. These settings only take "
+                "effect when noise is baked at dataset-prep time (--train_datasets, no "
+                "--use_preprocessed).",
+                " and ".join(ignored),
+            )
+
     def _mix_mel_noise(self, base_features: torch.Tensor, pad_amount: int) -> torch.Tensor:
-        """Mixes noise directly in the linear mel-spectrogram space for fast on-the-fly augmentation."""
+        """Mixes noise directly in the linear mel-spectrogram space for fast on-the-fly augmentation.
+
+        Reuses NoiseAugmenter.apply()'s own building blocks - build_noise_waveform() (which
+        clip(s), perturbed how, burst-placed how) and snr_target_rms() (the dB->target-RMS
+        formula) - rather than re-deriving them; only the final mixing step differs, because
+        this path only has mel features for the speech side, not a raw waveform. That
+        constraint means the noise-only bandpass and the mixed-signal soft-clip/bandpass
+        (simulate_radio_channel / filter_signal_too / radio_clip_drive) - both waveform-domain
+        nonlinear/filtering ops - cannot be reproduced here; only SNR-based mixing is applied
+        (warned about in __post_init__).
+
+        `pad_amount` is accepted but unused: `base_features` is already the padding-stripped
+        real-content region (see DatasetPreparator._prepare_example_audio), and the caller
+        re-appends the stored pad value after this returns - so noise never touches the pad.
+        """
         if self.noise_augmenter is None:
             return base_features
-        
+
         # Roll for noise
         noise_decision = self.noise_augmenter.decide_augmentation(np.random.default_rng())
         if noise_decision is None:
             return base_features
-            
-        import librosa
-        from preprocess.noise_augmentation import _place_bursts
-        
+
+        from preprocess.noise_augmentation import build_noise_waveform, snr_target_rms
+
         feat_len = base_features.shape[-1]
         audio_samples = feat_len * 160  # Whisper hop length is 160 (10ms @ 16kHz)
-        mixed_noise = np.zeros(audio_samples, dtype=np.float32)
-        
-        for idx, gain_db, offset_seed, stretch, pitch, coverage_frac in zip(
-            noise_decision["noise_indices"],
-            noise_decision["gain_jitters_db"],
-            noise_decision["offset_seeds"],
-            noise_decision["time_stretch_factors"],
-            noise_decision["pitch_shift_semitones"],
-            noise_decision["coverage_fracs"],
-        ):
-            clip = self.noise_augmenter.library.clips[idx]
-            local_rng = np.random.default_rng(offset_seed)
-            if stretch != 1.0 or pitch != 0.0:
-                if stretch != 1.0:
-                    clip = librosa.effects.time_stretch(clip, rate=stretch)
-                if pitch != 0.0:
-                    clip = librosa.effects.pitch_shift(clip, sr=16000, n_steps=pitch)
-                clip = clip.astype(np.float32)
-            
-            segment = _place_bursts(clip, audio_samples, coverage_frac, self.noise_augmenter.burst_len_frac_range, local_rng)
-            segment = segment * (10 ** (gain_db / 20))
-            mixed_noise += segment
-            
+        # Same "realize the decision into a noise waveform" step NoiseAugmenter.apply() uses -
+        # only what happens to it next (mel-power mixing here vs. waveform mixing there) differs,
+        # because this path only has mel features for the speech side, never a raw waveform.
+        mixed_noise = build_noise_waveform(
+            noise_decision,
+            self.noise_augmenter.library,
+            self.noise_augmenter.burst_len_frac_range,
+            self.noise_augmenter.target_sampling_rate,
+            audio_samples,
+        )
+
         # Get mel power of the pure noise
         noise_feat_result = self.processor.feature_extractor(
             mixed_noise, sampling_rate=16000, return_attention_mask=False
@@ -214,7 +241,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         noise_rms = torch.sqrt(torch.mean(noise_power) + 1e-12)
 
         snr_db = noise_decision["snr_db"]
-        target_noise_rms = signal_rms / (10 ** (snr_db / 20))
+        target_noise_rms = snr_target_rms(signal_rms, snr_db)
         scaled_noise_power = noise_power * ((target_noise_rms / noise_rms) ** 2)
 
         mixed_power = signal_power + scaled_noise_power
@@ -577,7 +604,17 @@ def parse_arguments():
         "--ds_processor_proc_num", type=int, default=1, help="Number of parallel processors for datasets preparation"
     )
     parser.add_argument("--model_name", default="openai/whisper-large-v2", help="Name of the model to train")
-    parser.add_argument("--output_model_name", required=True, help="Name of the fine-tuned model to generate")
+    parser.add_argument(
+        "--output_model_name",
+        default=None,
+        help="Name of the fine-tuned model to generate. Also used as the run tracker (e.g. "
+        "wandb) run name, so a run is always trivially matched to its local output dir/"
+        "checkpoints - there is no separate --run_name. If omitted, a name is generated "
+        "from the run's hyperparameters (e.g. 'lv3-mix-na-b32-kd0.1'). Either way, if that "
+        "name already exists as a local output dir, '_2', '_3', etc. is appended rather "
+        "than overwriting it - unless --resume_from_checkpoint is set, in which case the "
+        "name is used as-is so resuming finds the existing checkpoints.",
+    )
     parser.add_argument("--hf_org_name", default="ivrit-ai", help="Name of HF Org to push the model to")
     parser.add_argument("--skip_push_to_hub", action="store_true", help="Don't push result model to hub")
     parser.add_argument(
@@ -678,7 +715,9 @@ def parse_arguments():
     parser.add_argument("--per_device_train_batch_size", type=int, default=16, help="Per-device train batch size.")
     parser.add_argument("--per_device_eval_batch_size", type=int, default=16, help="Per-device eval batch size.")
 
-    parser.add_argument("--run_name", help="Run name to report to the run tracker")
+    parser.add_argument(
+        "--no_report", action="store_true", help="Disable reporting to run trackers (e.g. wandb)."
+    )
     parser.add_argument("--logging_steps", type=int, default=500, help="Number of step between each log")
 
     pg = parser.add_argument_group("noise augmentation")
@@ -730,6 +769,48 @@ def _load_noise_config(yaml_path: str) -> dict:
         raise ValueError("noise_config YAML must include 'noise_dir'")
 
     return cfg
+
+
+def _init_run_tracking(args, noise_kwargs: dict) -> None:
+    """Pre-init the wandb run with the full effective config, so the run's Overview/Config
+    tab shows every setting that actually shaped this run - not just what Seq2SeqTrainer's
+    own WandbCallback captures (TrainingArguments fields only) plus a raw --noise_config
+    path string. wandb already auto-captures the launch command verbatim (see
+    wandb-metadata.json in any past run dir) - that solves "what command produced this run"
+    but not "what does --noise_config path/to/file.yaml actually mean", since the YAML's
+    contents never reach the command line at all.
+
+    Calling wandb.init() here (before the Trainer exists) is the documented way to add
+    custom config: WandbCallback.setup() checks `if wandb.run is None` before calling its
+    own wandb.init(), and just layers TrainingArguments on top of whatever run/config
+    already exists via `config.update(..., allow_val_change=True)` - so this doesn't fight
+    or get overwritten by the Trainer's own reporting, it's additive.
+    """
+    if args.no_report:
+        return
+
+    try:
+        import wandb
+    except ImportError:
+        print("wandb not installed - skipping config pre-logging (pass --no_report to silence this).")
+        return
+
+    # vars(args) covers every CLI flag (dataset specs, augmentation probabilities, KD/label
+    # smoothing settings, etc.) that TrainingArguments doesn't know about and so would
+    # otherwise only ever be visible by re-reading wandb-metadata.json's raw argv dump.
+    # noise_kwargs is nested separately since it's the one thing that ISN'T on the command
+    # line at all - it's the resolved contents of --noise_config's YAML file.
+    config = {**vars(args), "noise": noise_kwargs}
+
+    wandb.init(
+        project=os.getenv("WANDB_PROJECT", "huggingface"),  # same default Trainer's WandbCallback uses
+        name=args.run_name,
+        config=config,
+    )
+    # Also attach the exact YAML file to the run's Files tab, so a config edited between
+    # runs is recoverable byte-for-byte, not just as the flattened/tuple-ified values above.
+    if args.noise_config:
+        wandb.save(args.noise_config, policy="now")
 
 
 def main():
@@ -835,7 +916,27 @@ def main():
 
     if args.max_eval_set_size:
         eval_set = eval_set.shuffle(seed=dataset_shuffle_seed).select(range(args.max_eval_set_size))
-        
+
+    resuming = bool(args.resume_from_checkpoint or args.resume_from_checkpoint_path)
+    if args.output_model_name is None:
+        args.output_model_name = generate_run_name(args)
+        print(f"--output_model_name not given, auto-generated: {args.output_model_name}")
+    if resuming:
+        # Resuming must land in the exact dir the checkpoints already live in - versioning
+        # it here would point the trainer at a fresh, checkpoint-less directory instead.
+        if local_dir_exists(args.output_model_name):
+            print(f"Resuming into existing output dir: {args.output_model_name}")
+    else:
+        deduped = dedupe_name(args.output_model_name, local_dir_exists)
+        if deduped != args.output_model_name:
+            print(f"Output dir '{args.output_model_name}' already exists, using '{deduped}' instead")
+            args.output_model_name = deduped
+    # Always kept identical to output_model_name (no separate --run_name) so the wandb
+    # run is trivially matched to the local output dir/checkpoints it corresponds to.
+    args.run_name = args.output_model_name
+
+    _init_run_tracking(args, noise_kwargs)
+
     decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
     train_noise_augmenter = preparator.noise_augmenter if args.use_preprocessed else None
 
@@ -933,7 +1034,7 @@ def main():
         logging_strategy="steps",
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        report_to="all" if args.run_name else "none",
+        report_to="none" if args.no_report else "all",
         load_best_model_at_end=False,
         metric_for_best_model="wer" if args.predict_wer else "loss",
         greater_is_better=False,
