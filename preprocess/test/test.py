@@ -49,8 +49,16 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib.util
+import logging
 import sys
 from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("noise_aug_test")
 
 import numpy as np
 import torch
@@ -249,7 +257,7 @@ def main():
         simulate_radio_channel=args.simulate_radio_channel,
         radio_clip_drive=args.radio_clip_drive,
     )
-    print(f"Loaded {len(augmenter.library)} noise clips from {args.noise_dir}")
+    logger.info("Loaded %d noise clips from %s", len(augmenter.library), args.noise_dir)
 
     rng = np.random.default_rng(args.seed)
 
@@ -262,29 +270,30 @@ def main():
         speech_ds = load_from_disk(str(args.speech_dataset))
         if isinstance(speech_ds, DatasetDict):
             split = args.split or next(iter(speech_ds.keys()))
-            print(f"'{args.speech_dataset}' is a DatasetDict, using split '{split}' (pass --split to change)")
+            logger.info("'%s' is a DatasetDict, using split '%s' (pass --split to change)", args.speech_dataset, split)
             speech_ds = speech_ds[split]
 
         # Detect dataset shape: pre-processed Whisper (input_features) vs raw audio
         ds_columns = speech_ds.column_names
         if "input_features" in ds_columns and args.audio_column not in ds_columns:
             speech_ds_mode = "features"
-            print(
-                f"Detected pre-processed Whisper dataset (has 'input_features', no '{args.audio_column}' column).\n"
-                f"  Will invert log-mel spectrogram → audio via Griffin-Lim for each example."
+            logger.info(
+                "Detected pre-processed Whisper dataset (has 'input_features', no '%s' column). "
+                "Will invert log-mel spectrogram -> audio via Griffin-Lim for each example.",
+                args.audio_column,
             )
         else:
             speech_ds_mode = "audio"
             from datasets import Audio as HFAudio  # local import to keep top-level clean
             speech_ds = speech_ds.cast_column(args.audio_column, HFAudio(sampling_rate=args.sr))
-            print(f"Detected raw-audio dataset ('{args.audio_column}' column present).")
+            logger.info("Detected raw-audio dataset ('%s' column present).", args.audio_column)
 
-        print(f"Loaded {len(speech_ds)} examples from arrow dataset {args.speech_dataset}")
+        logger.info("Loaded %d examples from arrow dataset %s", len(speech_ds), args.speech_dataset)
     elif args.speech_dir is not None:
         speech_files = _load_speech_files(args.speech_dir)
-        print(f"Loaded {len(speech_files)} speech files from {args.speech_dir}")
+        logger.info("Loaded %d speech files from %s", len(speech_files), args.speech_dir)
     else:
-        print("No --speech-dataset or --speech-dir given, generating synthetic speech-like clips instead.")
+        logger.info("No --speech-dataset or --speech-dir given, generating synthetic speech-like clips instead.")
 
     rows = []
     for i in range(args.n):
@@ -308,12 +317,36 @@ def main():
             src_name = "synthetic"
 
         decision = augmenter.decide_augmentation(rng)
+
+        if decision is None:
+            logger.info("[%03d] source=%-30s | NO NOISE (skipped by apply_prob)", i, src_name)
+        else:
+            noise_names = [augmenter.library.file_paths[j].name for j in decision["noise_indices"]]
+            logger.info(
+                "[%03d] source=%-30s | NOISE APPLIED\n"
+                "       clips       : %s\n"
+                "       SNR         : %.2f dB\n"
+                "       gain jitter : %s dB\n"
+                "       stretch     : %s\n"
+                "       pitch       : %s st\n"
+                "       coverage    : %s",
+                i,
+                src_name,
+                ", ".join(noise_names),
+                decision["snr_db"],
+                ", ".join(f"{g:+.1f}" for g in decision["gain_jitters_db"]),
+                ", ".join(f"{s:.3f}" for s in decision["time_stretch_factors"]),
+                ", ".join(f"{p:+.2f}" for p in decision["pitch_shift_semitones"]),
+                ", ".join(f"{c:.2f}" for c in decision["coverage_fracs"]),
+            )
+
         augmented = augmenter.apply(audio, decision)
 
         orig_name = f"{i:03d}_orig.wav"
         aug_name = f"{i:03d}_aug.wav"
         _save_wav(args.out_dir / orig_name, audio, args.sr)
         _save_wav(args.out_dir / aug_name, augmented, args.sr)
+        logger.debug("[%03d] saved %s and %s", i, orig_name, aug_name)
 
         if decision is None:
             rows.append({"idx": i, "source": src_name, "noise_applied": False})
@@ -379,9 +412,9 @@ audio {{ width: 220px; }}
     (args.out_dir / "index.html").write_text(html)
 
     n_noisy = sum(1 for r in rows if r["noise_applied"])
-    print(f"\nWrote {len(rows)} pairs to {args.out_dir}")
-    print(f"{n_noisy}/{len(rows)} had noise applied")
-    print(f"Open {args.out_dir / 'index.html'} in a browser to listen, or check decisions.csv for the raw params.")
+    logger.info("Done. Wrote %d pairs to %s", len(rows), args.out_dir)
+    logger.info("%d / %d examples had noise applied", n_noisy, len(rows))
+    logger.info("Open %s in a browser to listen, or check decisions.csv for the raw params.", args.out_dir / "index.html")
 
 
 if __name__ == "__main__":

@@ -2,12 +2,25 @@
 # coding: utf-8
 
 import argparse
+import logging
 import re
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Dict, List, Union
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Show noise-augmentation decisions + before/after RMS for every processed example
+logging.getLogger("preprocess.preperator").setLevel(logging.INFO)
+logging.getLogger(__name__).setLevel(logging.INFO)
+
+logger = logging.getLogger(__name__)
+
 import evaluate
+import numpy as np
 import torch
 from datasets import DatasetDict, interleave_datasets, load_dataset, load_from_disk, ReadInstruction
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -145,20 +158,99 @@ def load_datasets(dataset_specs):
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
     decoder_start_token_id: int
+    noise_augmenter: Any = None
+
+    def _mix_mel_noise(self, base_features: torch.Tensor, pad_amount: int) -> torch.Tensor:
+        """Mixes noise directly in the linear mel-spectrogram space for fast on-the-fly augmentation."""
+        if self.noise_augmenter is None:
+            return base_features
+        
+        # Roll for noise
+        noise_decision = self.noise_augmenter.decide_augmentation(np.random.default_rng())
+        if noise_decision is None:
+            return base_features
+            
+        import librosa
+        from preprocess.noise_augmentation import _place_bursts
+        
+        feat_len = base_features.shape[-1]
+        audio_samples = feat_len * 160  # Whisper hop length is 160 (10ms @ 16kHz)
+        mixed_noise = np.zeros(audio_samples, dtype=np.float32)
+        
+        for idx, gain_db, offset_seed, stretch, pitch, coverage_frac in zip(
+            noise_decision["noise_indices"],
+            noise_decision["gain_jitters_db"],
+            noise_decision["offset_seeds"],
+            noise_decision["time_stretch_factors"],
+            noise_decision["pitch_shift_semitones"],
+            noise_decision["coverage_fracs"],
+        ):
+            clip = self.noise_augmenter.library.clips[idx]
+            local_rng = np.random.default_rng(offset_seed)
+            if stretch != 1.0 or pitch != 0.0:
+                if stretch != 1.0:
+                    clip = librosa.effects.time_stretch(clip, rate=stretch)
+                if pitch != 0.0:
+                    clip = librosa.effects.pitch_shift(clip, sr=16000, n_steps=pitch)
+                clip = clip.astype(np.float32)
+            
+            segment = _place_bursts(clip, audio_samples, coverage_frac, self.noise_augmenter.burst_len_frac_range, local_rng)
+            segment = segment * (10 ** (gain_db / 20))
+            mixed_noise += segment
+            
+        # Get mel power of the pure noise
+        noise_feat_result = self.processor.feature_extractor(
+            mixed_noise, sampling_rate=16000, return_attention_mask=False
+        )
+        noise_features = torch.tensor(noise_feat_result["input_features"][0]) # (d, feat_len)
+        noise_features = noise_features[:, :feat_len]
+
+        # Convert log-mel back to linear mel power.
+        # Whisper log-mel is (log10(mel) + 4) / 4 -> log10(mel) = feat * 4 - 4
+        signal_power = 10.0 ** (base_features * 4.0 - 4.0)
+        noise_power = 10.0 ** (noise_features * 4.0 - 4.0)
+
+        signal_rms = torch.sqrt(torch.mean(signal_power) + 1e-12)
+        noise_rms = torch.sqrt(torch.mean(noise_power) + 1e-12)
+
+        snr_db = noise_decision["snr_db"]
+        target_noise_rms = signal_rms / (10 ** (snr_db / 20))
+        scaled_noise_power = noise_power * ((target_noise_rms / noise_rms) ** 2)
+
+        mixed_power = signal_power + scaled_noise_power
+        mixed_log10 = torch.log10(torch.clamp(mixed_power, min=1e-10))
+        mixed_log10 = torch.maximum(mixed_log10, mixed_log10.max() - 8.0)
+        mixed_features = (mixed_log10 + 4.0) / 4.0
+
+        noise_names = [self.noise_augmenter.library.file_paths[j].name for j in noise_decision["noise_indices"]]
+        logger.debug(
+            "[DataCollator] APPLIED MEL-NOISE | clips: %s | SNR: %.2f dB | "
+            "Mel RMS before: %.5f → after: %.5f",
+            ", ".join(noise_names),
+            snr_db,
+            signal_rms.item(),
+            torch.sqrt(torch.mean(mixed_power)).item(),
+        )
+
+        return mixed_features
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         # Ensure input_features are decompressed if needed:
         input_features = []
         for feature in features:
             pad_amount = feature.get("pad_amount", 0)
+            base_features = torch.tensor(feature["input_features"])  # (d, feat_len)
+            
+            # Apply on-the-fly mel-space mixing
+            base_features = self._mix_mel_noise(base_features, pad_amount)
+
             if pad_amount > 0:
                 pad_value = feature["pad_value"]  # (d)
                 pad_tensor = torch.tensor([pad_value] * pad_amount).T  # (d, pad_amount)
-                base_features = torch.tensor(feature["input_features"])  # (d, feat_len)
                 final_features = torch.concatenate([base_features, pad_tensor], dim=-1)  # (d, feat_len + pad_amount)
                 input_features.append(final_features)
             else:
-                input_features.append(torch.tensor(feature["input_features"]))
+                input_features.append(base_features)
 
         batch = BatchFeature({"input_features": torch.stack(input_features)})
 
@@ -265,9 +357,16 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
         kd_weight: float = 0.0,
         kd_temperature: float = 1.0,
         label_smoothing: float = 0.0,
+        eval_data_collator=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        # Optional separate collator for eval. Training's data_collator may apply
+        # randomized on-the-fly noise (see DataCollatorSpeechSeq2SeqWithPadding); using
+        # the same one for eval would mean every eval pass measures WER/loss against a
+        # freshly-and-randomly re-noised eval set, making eval metrics incomparable
+        # across steps/checkpoints. When set, get_eval_dataloader below swaps it in.
+        self.eval_data_collator = eval_data_collator
         self.teacher_model = teacher_model
         self.kd_weight = kd_weight
         self.kd_temperature = kd_temperature
@@ -293,6 +392,25 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
             self.teacher_model.eval()
             self.teacher_model.requires_grad_(False)
             self.teacher_dtype = next(self.teacher_model.parameters()).dtype
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        """Build the eval dataloader with eval_data_collator instead of the (possibly
+        noise-augmenting) training collator, if one was supplied.
+
+        The DataLoader captures the collate_fn at construction time, so it's enough to
+        swap self.data_collator only for the duration of the super() call and restore
+        it right after - the returned dataloader keeps using eval_data_collator on every
+        subsequent batch, while self.data_collator goes back to being the training one.
+        """
+        if self.eval_data_collator is None:
+            return super().get_eval_dataloader(eval_dataset)
+
+        original_collator = self.data_collator
+        self.data_collator = self.eval_data_collator
+        try:
+            return super().get_eval_dataloader(eval_dataset)
+        finally:
+            self.data_collator = original_collator
 
     def _transcription_loss(self, logits, labels, num_items_in_batch, label_smoothing):
         # Until the Whisper model loss is updated to use the new Transfomers loss infrastruture,
@@ -553,8 +671,11 @@ def parse_arguments():
         default=None,
         metavar="YAML_PATH",
         help="Path to a YAML file with noise augmentation settings. "
-             "Enables live noise augmentation during training (only works with --train_datasets, not --use_preprocessed). "
-             "See preprocess/noise_config.yaml for an annotated example.",
+             "With --use_preprocessed, noise is mixed live in the mel domain by the data "
+             "collator (fresh per batch, so it varies across epochs). With --train_datasets, "
+             "noise is instead baked once into the mel features at dataset-prep time "
+             "(same realization every epoch). Eval always uses a noise-free collator "
+             "regardless of this setting. See preprocess/noise_config.yaml for an annotated example.",
     )
     pg.add_argument(
         "--noise_dir",
@@ -694,9 +815,27 @@ def main():
 
     if args.max_eval_set_size:
         eval_set = eval_set.shuffle(seed=dataset_shuffle_seed).select(range(args.max_eval_set_size))
+        
+    decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+    train_noise_augmenter = preparator.noise_augmenter if args.use_preprocessed else None
 
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(
-        processor=processor, decoder_start_token_id=processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+        processor=processor,
+        decoder_start_token_id=decoder_start_token_id,
+        noise_augmenter=train_noise_augmenter,
+    )
+    # Eval always gets the noise-free collator, even when training uses on-the-fly
+    # noise augmentation - otherwise every eval pass measures against a freshly and
+    # randomly re-noised eval set, which makes WER/loss incomparable across evals and
+    # undermines checkpoint selection / early-stopping decisions.
+    eval_data_collator = (
+        DataCollatorSpeechSeq2SeqWithPadding(
+            processor=processor,
+            decoder_start_token_id=decoder_start_token_id,
+            noise_augmenter=None,
+        )
+        if train_noise_augmenter is not None
+        else None
     )
 
     metric = evaluate.load("wer")
@@ -812,6 +951,7 @@ def main():
         train_dataset=train_set,
         eval_dataset=eval_set,
         data_collator=data_collator,
+        eval_data_collator=eval_data_collator,
         compute_metrics=lambda pred: compute_metrics(pred, processor, metric, normalizer),
         processing_class=processor,
         teacher_model=teacher_model,

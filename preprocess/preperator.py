@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 import torch
 from datasets import (
@@ -15,6 +17,8 @@ from transformers import BatchFeature, WhisperProcessor
 
 from preprocess.augmentation import shift_audio_forward
 from preprocess.noise_augmentation import NoiseAugmenter
+
+logger = logging.getLogger(__name__)
 
 # This is defined as part of the model config
 # and should match the loaded model.
@@ -212,7 +216,25 @@ class DatasetPreparator:
         # decision stays stable/reproducible for a given seed state, independent of
         # when/how the audio itself gets loaded and resampled.
         if self.noise_augmenter is not None:
-            ancillary_features["noise_augmentation"] = self.noise_augmenter.decide_augmentation(self.seed)
+            noise_decision = self.noise_augmenter.decide_augmentation(self.seed)
+            ancillary_features["noise_augmentation"] = noise_decision
+            if noise_decision is None:
+                logger.debug("Noise augmentation: SKIPPED (apply_prob roll)")
+            else:
+                noise_names = [
+                    self.noise_augmenter.library.file_paths[j].name
+                    for j in noise_decision["noise_indices"]
+                ]
+                logger.debug(
+                    "Noise augmentation DECIDED | clips: %s | SNR: %.2f dB | "
+                    "gain jitter: %s dB | stretch: %s | pitch: %s st | coverage: %s",
+                    ", ".join(noise_names),
+                    noise_decision["snr_db"],
+                    ", ".join(f"{g:+.1f}" for g in noise_decision["gain_jitters_db"]),
+                    ", ".join(f"{s:.3f}" for s in noise_decision["time_stretch_factors"]),
+                    ", ".join(f"{p:+.2f}" for p in noise_decision["pitch_shift_semitones"]),
+                    ", ".join(f"{c:.2f}" for c in noise_decision["coverage_fracs"]),
+                )
         else:
             ancillary_features["noise_augmentation"] = None
 
@@ -236,7 +258,19 @@ class DatasetPreparator:
 
         if self.noise_augmenter is not None:
             noise_decision = ancillary_features.get("noise_augmentation")
-            resampled_audio_array = self.noise_augmenter.apply(resampled_audio_array, noise_decision)
+            if noise_decision is not None:
+                rms_before = float(np.sqrt(np.mean(np.square(resampled_audio_array)) + 1e-12))
+                resampled_audio_array = self.noise_augmenter.apply(resampled_audio_array, noise_decision)
+                rms_after = float(np.sqrt(np.mean(np.square(resampled_audio_array)) + 1e-12))
+                logger.debug(
+                    "Noise augmentation APPLIED | RMS before: %.5f → after: %.5f (SNR target: %.2f dB)",
+                    rms_before,
+                    rms_after,
+                    noise_decision["snr_db"],
+                )
+            else:
+                resampled_audio_array = self.noise_augmenter.apply(resampled_audio_array, noise_decision)
+                logger.debug("Noise augmentation SKIPPED for this example (decision=None)")
 
         # We want to use the device kwargs - we call the feature extractor directly
         # to avoid warning from the tokenizer (which does not know how to consume a device kwarg)
