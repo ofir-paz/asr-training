@@ -19,13 +19,20 @@ apply_prob: 0.6
 
 # Signal-to-Noise Ratio range in dB, sampled uniformly per example.
 # Lower = louder noise.  4 dB is already quite harsh; 25 dB is subtle.
-snr_db_range: [4.0, 25.0]
+snr_db_range: [4.0, 20.0]
 
 # Random +/- gain jitter (dB) applied to each noise clip before SNR scaling.
 # Prevents the model from memorising exact clip amplitudes.
 gain_jitter_db: 3.0
 
-# -- Per-clip perturbation -----------------------------------------------------
+# What fraction of the speech is covered by noise bursts (sampled per clip).
+# 0.5–0.8 → noise covers 50–80% of the utterance duration.
+coverage_frac_range: [0.6, 0.8]
+
+# What fraction of each noise clip is used per burst (90–100% = near-full clip).
+burst_len_frac_range: [0.9, 1.0]
+
+# ── Per-clip perturbation (requires librosa) ──────────────────────────────────
 
 # Probability that a picked clip gets time-stretch + pitch-shift applied.
 # 0.3 -> 30% of clips are slightly perturbed. Keep low: goal is variety, not distortion.
