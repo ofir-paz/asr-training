@@ -5,7 +5,7 @@ from run_naming import dedupe_name, generate_run_name
 
 def _args(**overrides):
     base = dict(
-        model_name="openai/whisper-large-v3",
+        model_name="ivrit-ai/whisper-large-v3",
         train_datasets=None,
         use_preprocessed=None,
         noise_augmentation=False,
@@ -33,11 +33,11 @@ class TestGenerateRunName:
         assert generate_run_name(args) == "lv3-mix-na-b32-kd0.1-sm0.1-bf16"
 
     def test_model_shortcodes(self):
-        assert generate_run_name(_args(model_name="openai/whisper-large-v2")).startswith("lv2")
-        assert generate_run_name(_args(model_name="openai/whisper-large-v1")).startswith("lv1")
-        assert generate_run_name(_args(model_name="openai/whisper-medium")).startswith("med")
-        assert generate_run_name(_args(model_name="openai/whisper-small")).startswith("sm")
-        assert generate_run_name(_args(model_name="openai/whisper-tiny")).startswith("tiny")
+        assert generate_run_name(_args(model_name="ivrit-ai/whisper-large-v2")).startswith("lv2")
+        assert generate_run_name(_args(model_name="ivrit-ai/whisper-large-v1")).startswith("lv1")
+        assert generate_run_name(_args(model_name="ivrit-ai/whisper-medium")).startswith("med")
+        assert generate_run_name(_args(model_name="ivrit-ai/whisper-small")).startswith("sm")
+        assert generate_run_name(_args(model_name="ivrit-ai/whisper-tiny")).startswith("tiny")
 
     def test_unknown_model_falls_back_to_slug(self):
         name = generate_run_name(_args(model_name="myorg/custom-ckpt-v9"))

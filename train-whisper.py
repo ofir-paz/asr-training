@@ -821,7 +821,9 @@ def parse_arguments():
         type=str,
         default=None,
         metavar="YAML_PATH",
-        help="Path to a YAML file with noise augmentation settings. "
+        help="Path to a YAML file with noise augmentation settings - the single source of "
+             "defaults for every noise_* setting below; --noise_<key> flags (e.g. "
+             "--noise_apply_prob) override one key at a time without editing the file. "
              "With --use_preprocessed, noise is mixed live in the mel domain by the data "
              "collator (fresh per batch, so it varies across epochs). With --train_datasets, "
              "noise is instead baked once into the mel features at dataset-prep time "
@@ -835,6 +837,51 @@ def parse_arguments():
         metavar="PATH",
         help="Override the noise_dir from --noise_config without editing the YAML.",
     )
+    # One override flag per --noise_config key, all defaulting to None ("use whatever the
+    # YAML says"). The YAML stays the single source of defaults; these are for a one-off
+    # change (a quick sweep, a debugging run) without editing or forking the file. Every
+    # flag here requires --noise_augmentation, same as --noise_dir above - see the check
+    # in main().
+    pg.add_argument("--noise_apply_prob", type=float, default=None, help="Override apply_prob.")
+    pg.add_argument(
+        "--noise_snr_db_range", type=float, nargs=2, default=None, metavar=("MIN_DB", "MAX_DB"),
+        help="Override snr_db_range.",
+    )
+    pg.add_argument(
+        "--noise_num_noises_range", type=int, nargs=2, default=None, metavar=("MIN", "MAX"),
+        help="Override num_noises_range.",
+    )
+    pg.add_argument("--noise_gain_jitter_db", type=float, default=None, help="Override gain_jitter_db.")
+    pg.add_argument(
+        "--noise_coverage_frac_range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
+        help="Override coverage_frac_range.",
+    )
+    pg.add_argument(
+        "--noise_burst_len_frac_range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
+        help="Override burst_len_frac_range.",
+    )
+    pg.add_argument("--noise_perturb_prob", type=float, default=None, help="Override perturb_prob.")
+    pg.add_argument(
+        "--noise_time_stretch_range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
+        help="Override time_stretch_range.",
+    )
+    pg.add_argument(
+        "--noise_pitch_shift_semitone_range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
+        help="Override pitch_shift_semitone_range.",
+    )
+    pg.add_argument(
+        "--noise_simulate_radio_channel", action=argparse.BooleanOptionalAction, default=None,
+        help="Override simulate_radio_channel.",
+    )
+    pg.add_argument(
+        "--noise_radio_band_hz", type=float, nargs=2, default=None, metavar=("LOW_HZ", "HIGH_HZ"),
+        help="Override radio_band_hz.",
+    )
+    pg.add_argument(
+        "--noise_filter_signal_too", action=argparse.BooleanOptionalAction, default=None,
+        help="Override filter_signal_too.",
+    )
+    pg.add_argument("--noise_radio_clip_drive", type=float, default=None, help="Override radio_clip_drive.")
     pg.add_argument(
         "--noise_augmentation",
         action="store_true",
@@ -864,6 +911,66 @@ def _load_noise_config(yaml_path: str) -> dict:
         raise ValueError("noise_config YAML must include 'noise_dir'")
 
     return cfg
+
+
+# Every key --noise_config accepts, each with a matching --noise_<key> CLI flag (see
+# parse_arguments) that overrides it when explicitly passed. Args and YAML keys share this
+# exact name, so the merge in main() is a plain getattr/dict-set - no separate mapping needed.
+_NOISE_CONFIG_OVERRIDE_KEYS = [
+    "noise_dir",
+    "noise_apply_prob",
+    "noise_snr_db_range",
+    "noise_num_noises_range",
+    "noise_gain_jitter_db",
+    "noise_coverage_frac_range",
+    "noise_burst_len_frac_range",
+    "noise_perturb_prob",
+    "noise_time_stretch_range",
+    "noise_pitch_shift_semitone_range",
+    "noise_simulate_radio_channel",
+    "noise_radio_band_hz",
+    "noise_filter_signal_too",
+    "noise_radio_clip_drive",
+]
+
+
+def _resolve_noise_kwargs(args) -> dict:
+    """Resolve the effective noise-augmentation kwargs: YAML defaults, then per-key CLI
+    overrides layered on top. The YAML stays the single source of defaults - the CLI flags
+    (--noise_<key>, one per _NOISE_CONFIG_OVERRIDE_KEYS entry, all default None) are for a
+    one-off change (a quick sweep, a debugging run) without editing or forking the file.
+
+    Returns {} when --noise_augmentation is off. Raises if any --noise_<key> override was
+    passed without --noise_augmentation - silently ignoring it would be worse than erroring,
+    since it looks like it should have done something.
+    """
+    if not args.noise_augmentation:
+        set_without_augmentation = [
+            key for key in _NOISE_CONFIG_OVERRIDE_KEYS if getattr(args, key) is not None
+        ]
+        if set_without_augmentation:
+            flags = ", ".join(f"--{key}" for key in set_without_augmentation)
+            raise ValueError(f"{flags} require --noise_augmentation to also be set")
+        return {}
+
+    if not args.noise_config:
+        raise ValueError("--noise_augmentation requires --noise_config to also be set")
+    noise_kwargs = _load_noise_config(args.noise_config)
+
+    # nargs=2 flags arrive as lists; match _load_noise_config's own tuple convention.
+    overridden = []
+    for key in _NOISE_CONFIG_OVERRIDE_KEYS:
+        value = getattr(args, key)
+        if value is not None:
+            noise_kwargs[key] = tuple(value) if isinstance(value, list) else value
+            overridden.append(key)
+
+    noise_kwargs["noise_augmentation"] = True
+    print(f"Noise augmentation enabled (config: {args.noise_config})")
+    if overridden:
+        print(f"  CLI overrides: {', '.join(f'{k}={noise_kwargs[k]}' for k in overridden)}")
+    print(f"  noise_dir: {noise_kwargs['noise_dir']}")
+    return noise_kwargs
 
 
 def _init_run_tracking(args, noise_kwargs: dict) -> None:
@@ -919,18 +1026,7 @@ def main():
 
     processor = WhisperProcessor.from_pretrained(args.model_name, language=args.target_language, task="transcribe")
 
-    noise_kwargs = {}
-    if args.noise_augmentation:
-        if not args.noise_config:
-            raise ValueError("--noise_augmentation requires --noise_config to also be set")
-        noise_kwargs = _load_noise_config(args.noise_config)
-        if args.noise_dir:
-            noise_kwargs["noise_dir"] = args.noise_dir
-        noise_kwargs["noise_augmentation"] = True
-        print(f"Noise augmentation enabled (config: {args.noise_config})")
-        print(f"  noise_dir: {noise_kwargs['noise_dir']}")
-    elif args.noise_dir:
-        raise ValueError("--noise_dir requires --noise_augmentation to also be set")
+    noise_kwargs = _resolve_noise_kwargs(args)
 
     preparator = DatasetPreparator(
         processor,
