@@ -114,6 +114,28 @@ class TestMixMelNoise:
         out = collator._mix_mel_noise(feats, pad_amount=3000 - feat_len)
         assert out.shape == (N_MELS, feat_len)
 
+    def test_silent_noise_realization_is_skipped_not_amplified(
+        self, train_whisper_module, fake_processor, noise_dir, monkeypatch
+    ):
+        """A silent noise realization must add nothing.
+
+        Digital silence doesn't round-trip to zero mel power - it lands on the ~1e-10 log
+        floor - so scaling it to hit the target SNR would multiply it by ~1e7 and synthesize
+        flat broadband hiss out of the numerical floor. The near-silence guard must catch it.
+        """
+        augmenter = NoiseAugmenter(noise_dir=str(noise_dir), target_sampling_rate=SR, apply_prob=1.0)
+        collator = train_whisper_module.DataCollatorSpeechSeq2SeqWithPadding(
+            processor=fake_processor,
+            decoder_start_token_id=DECODER_START_TOKEN_ID,
+            noise_augmenter=augmenter,
+        )
+        monkeypatch.setattr(
+            "preprocess.noise_augmentation.build_noise_waveform",
+            lambda *a, **k: np.zeros(a[-1] if a else k["length"], dtype=np.float32),
+        )
+        feats = torch.rand(N_MELS, 300) * 0.5 + 0.2
+        assert torch.equal(collator._mix_mel_noise(feats, pad_amount=0), feats)
+
 
 class TestResampleMel:
     def test_noop_when_disabled(self, train_whisper_module, fake_processor):

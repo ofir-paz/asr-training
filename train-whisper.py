@@ -7,6 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 logging.basicConfig(
@@ -126,7 +127,9 @@ def load_datasets(dataset_specs):
         # than ".arrow" files which leads to a mis-detection of the dataset format.
         # The "load_from_disk" API can get around this problem since it's designed to load
         # such locally stored dataset generated using "save_to_disk"
-        except:
+        # Scoped to Exception (not a bare except) so Ctrl-C during a slow remote load
+        # isn't swallowed and retried as a local load.
+        except Exception:
             dataset = load_from_disk(dataset_name)
             
             # But, we want to support the flexible "split instruction" syntax like load_dataset provides.
@@ -171,6 +174,18 @@ def _whisper_power_to_log_mel(power: torch.Tensor) -> torch.Tensor:
     log10_power = torch.log10(torch.clamp(power, min=1e-10))
     log10_power = torch.maximum(log10_power, log10_power.max() - 8.0)
     return (log10_power + 4.0) / 4.0
+
+
+# Below this, a mel-power array is "silence" as far as SNR mixing is concerned.
+#
+# Calibrated for the MEL-POWER domain, and deliberately NOT reusing
+# preprocess.noise_augmentation._SILENCE_RMS_THRESHOLD (2e-6): that one sits just above
+# _rms()'s 1e-6 waveform floor, but this domain has a completely different floor. Digital
+# silence through Whisper's extractor clamps at log10(1e-10), which _whisper_log_mel_to_power
+# maps back to 1e-10 power, so _mel_power_rms bottoms out near sqrt(1e-10) = 1e-5 - ten times
+# ABOVE the waveform threshold, which therefore could never fire here. 2e-5 sits just above
+# the real floor, and is still ~2 orders of magnitude below any genuine noise content.
+_MEL_SILENCE_RMS_THRESHOLD = 2e-5
 
 
 def _mel_power_rms(power: torch.Tensor) -> torch.Tensor:
@@ -269,8 +284,11 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         from preprocess.noise_augmentation import build_noise_waveform, snr_target_rms
 
+        extractor = self.processor.feature_extractor
         feat_len = base_features.shape[-1]
-        audio_samples = feat_len * 160  # Whisper hop length is 160 (10ms @ 16kHz)
+        # Derived from the extractor rather than hardcoded: hop_length is how many samples
+        # one mel frame advances by, so feat_len frames came from feat_len*hop samples.
+        audio_samples = feat_len * extractor.hop_length
         # Same "realize the decision into a noise waveform" step NoiseAugmenter.apply() uses -
         # only what happens to it next (mel-power mixing here vs. waveform mixing there) differs,
         # because this path only has mel features for the speech side, never a raw waveform.
@@ -283,8 +301,8 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         )
 
         # Get mel power of the pure noise
-        noise_feat_result = self.processor.feature_extractor(
-            mixed_noise, sampling_rate=16000, return_attention_mask=False
+        noise_feat_result = extractor(
+            mixed_noise, sampling_rate=extractor.sampling_rate, return_attention_mask=False
         )
         noise_features = torch.tensor(noise_feat_result["input_features"][0]) # (d, feat_len)
         noise_features = noise_features[:, :feat_len]
@@ -295,6 +313,14 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         signal_rms = _mel_power_rms(signal_power)
         noise_rms = _mel_power_rms(noise_power)
+
+        # Mel-domain counterpart of the near-silence guard mix_audio_at_snr applies on the
+        # waveform side (see _MEL_SILENCE_RMS_THRESHOLD for why the threshold differs).
+        # Without it, a silent noise realization still has a non-zero mel floor, and scaling
+        # THAT up to hit the target SNR multiplies it by ~1e7 - synthesizing flat broadband
+        # hiss out of the numerical floor instead of correctly adding nothing.
+        if noise_rms < _MEL_SILENCE_RMS_THRESHOLD or signal_rms < _MEL_SILENCE_RMS_THRESHOLD:
+            return base_features
 
         snr_db = noise_decision["snr_db"]
         target_noise_rms = snr_target_rms(signal_rms, snr_db)
@@ -329,8 +355,12 @@ class DataCollatorSpeechSeq2SeqWithPadding:
             base_features = self._mix_mel_noise(base_features, pad_amount)
 
             if pad_amount > 0:
-                pad_value = feature["pad_value"]  # (d)
-                pad_tensor = torch.tensor([pad_value] * pad_amount).T  # (d, pad_amount)
+                # Broadcast the single stored pad column out to pad_amount copies. Built as
+                # one expand off a (d,) tensor rather than torch.tensor([pad_value]*n) - that
+                # form asks torch to convert a python list of n numpy arrays, which it warns
+                # about and does slowly, once per example per batch.
+                pad_value = torch.as_tensor(np.asarray(feature["pad_value"], dtype=np.float32))  # (d,)
+                pad_tensor = pad_value.unsqueeze(-1).expand(-1, pad_amount)  # (d, pad_amount)
                 final_features = torch.concatenate([base_features, pad_tensor], dim=-1)  # (d, feat_len + pad_amount)
                 input_features.append(final_features)
             else:
@@ -928,8 +958,10 @@ def main():
             preprocessed_dataset_dicts.append(dataset_dict)
 
         if len(preprocessed_dataset_dicts) == 1:
-            train_set = dataset_dict["train"]
-            eval_set = dataset_dict["eval"]
+            # Index the list rather than reusing the loop variable above - same object today
+            # only because the loop ran exactly once, which is a trap if the loop ever changes.
+            train_set = preprocessed_dataset_dicts[0]["train"]
+            eval_set = preprocessed_dataset_dicts[0]["eval"]
         else:
             probs = None
             if args.use_preprocessed_probs is not None:
@@ -1121,7 +1153,14 @@ def main():
         greater_is_better=False,
         push_to_hub=(not args.skip_push_to_hub),
         run_name=args.run_name,
-        hub_model_id=f"{args.hf_org_name}/{args.output_model_name}" if not args.skip_push_to_hub else None,
+        # Only the final path segment can go in a Hub repo id - output_model_name is often a
+        # full local path (e.g. /Users/Shared/asr/training/lv3-...), and interpolating that
+        # whole path would build an invalid id like "ivrit-ai//Users/Shared/asr/...".
+        hub_model_id=(
+            f"{args.hf_org_name}/{Path(args.output_model_name).name}"
+            if not args.skip_push_to_hub
+            else None
+        ),
         remove_unused_columns=False,
         # Configure mixed precision based on the argument
         bf16=True if args.mixed_precision == "bf16" else None,
@@ -1137,6 +1176,9 @@ def main():
         # Whisper keeps no cache during training, so the non-reentrant implementation is safe
         # and is the one that composes with the rest of the Trainer machinery.
         gradient_checkpointing_kwargs={"use_reentrant": False} if args.gradient_checkpointing else None,
+        # When resuming, skip replaying the already-consumed batches of the interrupted epoch
+        # if asked to. Previously parsed but never forwarded, so --ignore_data_skip did nothing.
+        ignore_data_skip=args.ignore_data_skip,
         # There is not branching in training the Whisper model
         ddp_find_unused_parameters=False,
         # This would take longer, but will calculate the loss
