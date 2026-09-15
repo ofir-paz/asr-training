@@ -1,33 +1,29 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
-import argparse
 import logging
 import os
 import re
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Callable, List
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
-# Show noise-augmentation decisions + before/after RMS for every processed example
 logging.getLogger("preprocess.preperator").setLevel(logging.INFO)
 logging.getLogger(__name__).setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
 import evaluate
-import numpy as np
 import torch
 from datasets import DatasetDict, interleave_datasets, load_dataset, load_from_disk, ReadInstruction
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
-    BatchFeature,
     BitsAndBytesConfig,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
@@ -36,20 +32,19 @@ from transformers import (
 )
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 
+from training.dataloader import DataCollatorSpeechSeq2SeqWithPadding
+from training.parser import _resolve_noise_kwargs, parse_arguments
 from preprocess.preperator import (
     DatasetPreparator,
     process_datasets,
     whisper_max_target_positions,
 )
-from run_naming import dedupe_name, generate_run_name, local_dir_exists
+from training.run_naming import dedupe_name, generate_run_name, local_dir_exists
 
-# Split on : but allow : inside [] for the HF split slicing syntax
-# https://huggingface.co/docs/datasets/loading#slice-splits
+# Splits on ":" but not inside "[...]" - HF's split-slicing syntax.
 dataset_spec_split_pattern = r":(?=(?:[^\[\]]|\[[^\[\]]*\])*$)"
 
-# The preparator requires the transcript to live in a "transcript" column, but datasets
-# in the wild name it differently - crowd-transcribe-v5 uses "sentence", saspeech/eval-d1
-# use "text", fleurs uses "transcription". Renaming is metadata-only - no data is copied.
+# Column names some datasets use instead of "transcript" (renaming is metadata-only).
 transcript_column_aliases = ["sentence", "text", "transcription"]
 
 
@@ -70,20 +65,13 @@ def normalize_transcript_column(dataset, dataset_name):
 
 @dataclass
 class DatasetRowFilter:
-    """A quality rule expressed over a dataset's own columns.
-
-    `columns` scopes the predicate to the columns it reads, which is what keeps the audio
-    column undecoded - filtering whole rows would decode every example in the dataset.
-    """
+    """A quality rule; `columns` scopes it so filtering doesn't decode audio."""
 
     columns: List[str]
     keep: Callable[..., bool]
 
 
-# Some datasets carry quality signals of their own that are not part of the training
-# schema. Those rules are declared per dataset here rather than teaching the shared
-# preparator about columns only one dataset has. Length is deliberately not filtered on -
-# the preparator already drops examples whose labels exceed the model's target positions.
+# Per-dataset quality rules not part of the shared schema.
 dataset_row_filters = {
     "ivrit-ai/crowd-transcribe-v5": DatasetRowFilter(
         columns=["extra_data"],
@@ -112,37 +100,24 @@ def load_datasets(dataset_specs):
     datasets = []
     for spec in dataset_specs:
         parts = re.split(dataset_spec_split_pattern, spec)
-
         dataset_name = parts[0]
         split = parts[1] if len(parts) == 2 else "train"
 
-        
         try:
             dataset = load_dataset(dataset_name, split=split)
             if dataset.builder_name == "json" and not "transcript" in dataset.features:
-                print(f"Assumed dataset format mis-detection. Attempting to load. using `load_from_disk` instead. (See comments in code)")
+                print("Assumed dataset format mis-detection. Attempting to load using `load_from_disk` instead.")
                 raise ValueError("Dataset format mis-detection.")
-        
-        # Local datasets, could suffer from a bug where there are more ".json" files
-        # than ".arrow" files which leads to a mis-detection of the dataset format.
-        # The "load_from_disk" API can get around this problem since it's designed to load
-        # such locally stored dataset generated using "save_to_disk"
-        # Scoped to Exception (not a bare except) so Ctrl-C during a slow remote load
-        # isn't swallowed and retried as a local load.
-        except Exception:
+        except Exception:  # local dataset misdetected as remote; scoped so Ctrl-C isn't swallowed
             dataset = load_from_disk(dataset_name)
-            
-            # But, we want to support the flexible "split instruction" syntax like load_dataset provides.
-            # Hf made this extremely hard, by hiding the parsing and results inside a wrapped internal class.
-            # Why? why HF ?!
+
+            # Support load_dataset's split-slicing syntax here too.
             read_instruction = ReadInstruction.from_spec(split)
             actual_ri_data = read_instruction._relative_instructions[0]
             slice_units = actual_ri_data.unit
-            # We won't go that crazy - only support "abs" units (not pct syntax)
-            if slice_units != 'abs':
-                # This is such shame - HF please fix this.
+            if slice_units != 'abs':  # only "abs" units supported, not pct syntax
                 raise ValueError(f'Unable to support the split definition: ${split} - please read the code for more details.')
-            
+
             split_name = actual_ri_data.splitname
             from_entry = actual_ri_data.from_
             to_entry = actual_ri_data.to
@@ -159,259 +134,11 @@ def load_datasets(dataset_specs):
     return datasets
 
 
-def _whisper_log_mel_to_power(log_mel: torch.Tensor) -> torch.Tensor:
-    """Inverts WhisperFeatureExtractor's log-mel normalization: stored = (log10(mel)+4)/4,
-    so log10(mel) = stored*4-4. Exact and lossless (just undoing a log10 curve) - not a
-    spectral/waveform reconstruction.
-    """
-    return 10.0 ** (log_mel * 4.0 - 4.0)
-
-
-def _whisper_power_to_log_mel(power: torch.Tensor) -> torch.Tensor:
-    """Re-applies WhisperFeatureExtractor's own clamp/log10/dynamic-range-clip/normalize
-    sequence to linear mel power, the exact inverse of _whisper_log_mel_to_power.
-    """
-    log10_power = torch.log10(torch.clamp(power, min=1e-10))
-    log10_power = torch.maximum(log10_power, log10_power.max() - 8.0)
-    return (log10_power + 4.0) / 4.0
-
-
-# Below this, a mel-power array is "silence" as far as SNR mixing is concerned.
-#
-# Calibrated for the MEL-POWER domain, and deliberately NOT reusing
-# preprocess.noise_augmentation._SILENCE_RMS_THRESHOLD (2e-6): that one sits just above
-# _rms()'s 1e-6 waveform floor, but this domain has a completely different floor. Digital
-# silence through Whisper's extractor clamps at log10(1e-10), which _whisper_log_mel_to_power
-# maps back to 1e-10 power, so _mel_power_rms bottoms out near sqrt(1e-10) = 1e-5 - ten times
-# ABOVE the waveform threshold, which therefore could never fire here. 2e-5 sits just above
-# the real floor, and is still ~2 orders of magnitude below any genuine noise content.
-_MEL_SILENCE_RMS_THRESHOLD = 2e-5
-
-
-def _mel_power_rms(power: torch.Tensor) -> torch.Tensor:
-    """A 'loudness' proxy for an already-power (not amplitude) mel array: sqrt(mean(power)).
-
-    Deliberately NOT preprocess.noise_augmentation._rms's sqrt(mean(x**2)) - that formula
-    is for raw waveform amplitude samples; squaring an already-squared power value here
-    would be wrong. This is an approximation of true waveform RMS (see
-    NOISE_AUGMENTATION_AUDIT.md), used consistently everywhere this file needs a
-    power-domain SNR reference.
-    """
-    return torch.sqrt(torch.mean(power) + 1e-12)
-
-
-@dataclass
-class DataCollatorSpeechSeq2SeqWithPadding:
-    processor: Any
-    decoder_start_token_id: int
-    noise_augmenter: Any = None
-    # Mirrors noise_augmenter's baked-vs-live duality: --resample_augmentation always
-    # bakes the round trip into DatasetPreparator's output; when --use_preprocessed is
-    # also set there's no raw audio left to bake into at collation time, so this applies
-    # the same probability live, approximated in mel-space instead (see _resample_mel).
-    # None disables it (the default, and always the case for the eval collator).
-    resample_prob: Optional[float] = None
-    resample_target_hz: int = 8000
-
-    def __post_init__(self):
-        augmenter = self.noise_augmenter
-        if augmenter is None:
-            return
-        # These are waveform-domain effects (nonlinear soft-clip / filtering of the mixed
-        # signal); _mix_mel_noise only has access to mel features, not a raw waveform, so
-        # it cannot honor them. Warn loudly instead of silently dropping the config - this
-        # only matters for the live (--use_preprocessed) noise path; the baked
-        # (--train_datasets) path applies them in NoiseAugmenter.apply() as configured.
-        ignored = []
-        if augmenter.simulate_radio_channel and augmenter.filter_signal_too:
-            ignored.append("filter_signal_too")
-        if augmenter.simulate_radio_channel and augmenter.radio_clip_drive > 1.0:
-            ignored.append("radio_clip_drive")
-        if ignored:
-            logger.warning(
-                "[DataCollator] noise config sets %s, but the live/mel-domain noise "
-                "collator cannot apply waveform-domain radio-channel effects - only "
-                "SNR-based mixing will happen at train time. These settings only take "
-                "effect when noise is baked at dataset-prep time (--train_datasets, no "
-                "--use_preprocessed).",
-                " and ".join(ignored),
-            )
-
-    def _resample_mel(self, base_features: torch.Tensor) -> torch.Tensor:
-        """Live counterpart of DatasetPreparator's --resample_augmentation: approximates
-        the downsample+upsample bandwidth-limiting round trip by zeroing mel bins above
-        the target rate's Nyquist (see preprocess.augmentation.apply_resample_mel) rather
-        than reconstructing a waveform to actually resample - there's no raw waveform to
-        round-trip here, only mel features, and unlike noise (an external signal we
-        synthesize from scratch) this modifies the speech's own mel content directly.
-        """
-        if self.resample_prob is None:
-            return base_features
-        if np.random.default_rng().random() >= self.resample_prob:
-            return base_features
-
-        from preprocess.augmentation import apply_resample_mel
-
-        signal_power = _whisper_log_mel_to_power(base_features)
-        resampled_power = apply_resample_mel(
-            signal_power, self.processor.feature_extractor.sampling_rate, self.resample_target_hz
-        )
-        return _whisper_power_to_log_mel(resampled_power)
-
-    def _mix_mel_noise(self, base_features: torch.Tensor, pad_amount: int) -> torch.Tensor:
-        """Mixes noise directly in the linear mel-spectrogram space for fast on-the-fly augmentation.
-
-        Reuses NoiseAugmenter.apply()'s own building blocks - build_noise_waveform() (which
-        clip(s), perturbed how, burst-placed how) and snr_target_rms() (the dB->target-RMS
-        formula) - rather than re-deriving them; only the final mixing step differs, because
-        this path only has mel features for the speech side, not a raw waveform. That
-        constraint means the noise-only bandpass and the mixed-signal soft-clip/bandpass
-        (simulate_radio_channel / filter_signal_too / radio_clip_drive) - both waveform-domain
-        nonlinear/filtering ops - cannot be reproduced here; only SNR-based mixing is applied
-        (warned about in __post_init__).
-
-        `pad_amount` is accepted but unused: `base_features` is already the padding-stripped
-        real-content region (see DatasetPreparator._prepare_example_audio), and the caller
-        re-appends the stored pad value after this returns - so noise never touches the pad.
-        """
-        if self.noise_augmenter is None:
-            return base_features
-
-        # Roll for noise
-        noise_decision = self.noise_augmenter.decide_augmentation(np.random.default_rng())
-        if noise_decision is None:
-            return base_features
-
-        from preprocess.noise_augmentation import build_noise_waveform, snr_target_rms
-
-        extractor = self.processor.feature_extractor
-        feat_len = base_features.shape[-1]
-        # Derived from the extractor rather than hardcoded: hop_length is how many samples
-        # one mel frame advances by, so feat_len frames came from feat_len*hop samples.
-        audio_samples = feat_len * extractor.hop_length
-        # Same "realize the decision into a noise waveform" step NoiseAugmenter.apply() uses -
-        # only what happens to it next (mel-power mixing here vs. waveform mixing there) differs,
-        # because this path only has mel features for the speech side, never a raw waveform.
-        mixed_noise = build_noise_waveform(
-            noise_decision,
-            self.noise_augmenter.library,
-            self.noise_augmenter.burst_len_frac_range,
-            self.noise_augmenter.target_sampling_rate,
-            audio_samples,
-        )
-
-        # Get mel power of the pure noise
-        noise_feat_result = extractor(
-            mixed_noise, sampling_rate=extractor.sampling_rate, return_attention_mask=False
-        )
-        noise_features = torch.tensor(noise_feat_result["input_features"][0]) # (d, feat_len)
-        noise_features = noise_features[:, :feat_len]
-
-        # Convert log-mel back to linear mel power.
-        signal_power = _whisper_log_mel_to_power(base_features)
-        noise_power = _whisper_log_mel_to_power(noise_features)
-
-        signal_rms = _mel_power_rms(signal_power)
-        noise_rms = _mel_power_rms(noise_power)
-
-        # Mel-domain counterpart of the near-silence guard mix_audio_at_snr applies on the
-        # waveform side (see _MEL_SILENCE_RMS_THRESHOLD for why the threshold differs).
-        # Without it, a silent noise realization still has a non-zero mel floor, and scaling
-        # THAT up to hit the target SNR multiplies it by ~1e7 - synthesizing flat broadband
-        # hiss out of the numerical floor instead of correctly adding nothing.
-        if noise_rms < _MEL_SILENCE_RMS_THRESHOLD or signal_rms < _MEL_SILENCE_RMS_THRESHOLD:
-            return base_features
-
-        snr_db = noise_decision["snr_db"]
-        target_noise_rms = snr_target_rms(signal_rms, snr_db)
-        scaled_noise_power = noise_power * ((target_noise_rms / noise_rms) ** 2)
-
-        mixed_power = signal_power + scaled_noise_power
-        mixed_features = _whisper_power_to_log_mel(mixed_power)
-
-        noise_names = [self.noise_augmenter.library.file_paths[j].name for j in noise_decision["noise_indices"]]
-        logger.debug(
-            "[DataCollator] APPLIED MEL-NOISE | clips: %s | SNR: %.2f dB | "
-            "Mel RMS before: %.5f → after: %.5f",
-            ", ".join(noise_names),
-            snr_db,
-            signal_rms.item(),
-            _mel_power_rms(mixed_power).item(),
-        )
-
-        return mixed_features
-
-    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        # Ensure input_features are decompressed if needed:
-        input_features = []
-        for feature in features:
-            pad_amount = feature.get("pad_amount", 0)
-            base_features = torch.tensor(feature["input_features"])  # (d, feat_len)
-
-            # Apply on-the-fly mel-space augmentation. Order mirrors DatasetPreparator's
-            # baked path (shift -> resample -> noise): bandwidth-limit the channel first,
-            # then add noise on top of the degraded signal.
-            base_features = self._resample_mel(base_features)
-            base_features = self._mix_mel_noise(base_features, pad_amount)
-
-            if pad_amount > 0:
-                # Broadcast the single stored pad column out to pad_amount copies. Built as
-                # one expand off a (d,) tensor rather than torch.tensor([pad_value]*n) - that
-                # form asks torch to convert a python list of n numpy arrays, which it warns
-                # about and does slowly, once per example per batch.
-                pad_value = torch.as_tensor(np.asarray(feature["pad_value"], dtype=np.float32))  # (d,)
-                pad_tensor = pad_value.unsqueeze(-1).expand(-1, pad_amount)  # (d, pad_amount)
-                final_features = torch.concatenate([base_features, pad_tensor], dim=-1)  # (d, feat_len + pad_amount)
-                input_features.append(final_features)
-            else:
-                input_features.append(base_features)
-
-        batch = BatchFeature({"input_features": torch.stack(input_features)})
-
-        label_features = [{"input_ids": feature["labels"]} for feature in features]
-        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
-
-        labels = labels_batch["input_ids"]
-
-        # Labels, represent the input to the decoder
-        batch["decoder_input_ids"] = labels[:, :-1]
-
-        # Shift all labels to the left, thus the expected generated label
-        # is at the same index of the generated output id from the decoder
-        # and the loss function would compare them (cross entropy loss in this case)
-        # Note - this means there is no loss calculated for the first "start of transcript" token id
-        # since it is not expected to be predicted but always provided.
-        # The loss is calculated for the task/lang/notimestamp tokens since the model needs to know
-        # to associate them with the proper output
-        # **Warning!** the labels are shifted here, and some version of transformers will assume
-        # they are not if using the default "ForCausalLMLoss"
-        # Once Whisper is updated to use that built-in loss - need to reconsider the collator.
-        # Atm the custom loss function expects this shift to be done here.
-        labels = labels[:, 1:]
-        labels_mask = labels_batch.attention_mask[:, 1:]
-
-        # Where we do not need to attend when calculating loss - -100 is the agreed
-        # ignored value for the pytorch loss functions
-        labels = labels.masked_fill(labels_mask.ne(1), -100)
-
-        # replace initial prompt tokens with -100 to ignore correctly when computing the loss
-        bos_index = torch.argmax((labels == self.decoder_start_token_id).long(), dim=1)
-        bos_index = torch.where(bos_index > 0, bos_index + 1, bos_index)
-        prompt_mask = torch.arange(labels.shape[1]) < bos_index[:, None]
-        labels = torch.where(prompt_mask, -100, labels)
-
-        batch["labels"] = labels
-
-        return batch
-
-
 def compute_metrics(pred, processor, metric, normalizer):
     pred_ids = pred.predictions
     label_ids = pred.label_ids
 
-    # Replace the loss-ignored value with the padding token for this model
-    # which would be decoded to an empty string
-    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id  # else decodes as garbage
 
     pred_str = processor.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = processor.batch_decode(label_ids, skip_special_tokens=True)
@@ -436,7 +163,6 @@ def prepare_model_for_qlora(model):
         lora_alpha=1,
         use_rslora=True,
         target_modules=["q_proj", "k_proj", "v_proj", "fc1", "fc2", "out_proj"],
-        # modules_to_save=["embed_tokens"],
         lora_dropout=0.05,
         bias="none",
     )
@@ -448,21 +174,9 @@ def prepare_model_for_qlora(model):
 
 
 class WhisperDistillationTrainer(Seq2SeqTrainer):
-    """Seq2SeqTrainer with label smoothing and an optional frozen-teacher KL penalty.
-
-    The loss lives here rather than in a `compute_loss_func` hook because that hook only
-    receives the outputs and labels - running a teacher needs the model inputs, which
-    only `compute_loss` sees.
-
-    The teacher is fed the same encoder features and decoder prefix as the student, so
-    the penalty is a per-token KL between two aligned next-token distributions. Pointing
-    it at the checkpoint being fine-tuned makes the term a trust region: it starts at
-    exactly zero and grows only as the student drifts.
-
-    Label smoothing and the KL penalty are both applied during training only - eval loss
-    stays plain cross entropy so it can be compared across runs that configure them
-    differently. Track the regularized objective through `train/loss` and `train/kd_kl`.
-    """
+    """Seq2SeqTrainer with label smoothing and an optional frozen-teacher KL penalty
+    (a trust region when the teacher is the checkpoint being fine-tuned). Both are
+    training-only; eval loss stays plain cross entropy so runs stay comparable."""
 
     def __init__(
         self,
@@ -475,25 +189,14 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        # Optional separate collator for eval. Training's data_collator may apply
-        # randomized on-the-fly noise (see DataCollatorSpeechSeq2SeqWithPadding); using
-        # the same one for eval would mean every eval pass measures WER/loss against a
-        # freshly-and-randomly re-noised eval set, making eval metrics incomparable
-        # across steps/checkpoints. When set, get_eval_dataloader below swaps it in.
+        # Optional clean collator for eval, so on-the-fly augmentation doesn't make eval noisy.
         self.eval_data_collator = eval_data_collator
         self.teacher_model = teacher_model
         self.kd_weight = kd_weight
         self.kd_temperature = kd_temperature
         self.label_smoothing = label_smoothing
-        # Transformers halves-again the loss: training_step divides by
-        # gradient_accumulation_steps unless the model takes loss kwargs or a
-        # compute_loss_func was supplied. Our compute_loss already normalizes by
-        # num_items_in_batch, which counts the tokens of the WHOLE accumulation window, so
-        # the micro-batch losses already sum to the correct full-batch loss. Dividing again
-        # scales every gradient by 1/accum - silently training at lr/accum. The original
-        # code escaped this by passing compute_loss_func; a Trainer subclass has to suppress
-        # it here. The flag's only other uses are inside Trainer.compute_loss, which this
-        # class overrides in full, so nothing else changes.
+        # Suppresses Transformers' second division by grad_accum_steps - compute_loss
+        # already normalizes by num_items_in_batch (the whole accumulation window).
         self.model_accepts_loss_kwargs = True
 
         self._ce_total = 0.0
@@ -508,14 +211,8 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
             self.teacher_dtype = next(self.teacher_model.parameters()).dtype
 
     def get_eval_dataloader(self, eval_dataset=None):
-        """Build the eval dataloader with eval_data_collator instead of the (possibly
-        noise-augmenting) training collator, if one was supplied.
-
-        The DataLoader captures the collate_fn at construction time, so it's enough to
-        swap self.data_collator only for the duration of the super() call and restore
-        it right after - the returned dataloader keeps using eval_data_collator on every
-        subsequent batch, while self.data_collator goes back to being the training one.
-        """
+        """Swaps in eval_data_collator for construction only - DataLoader captures
+        collate_fn once, so self.data_collator can be restored right after."""
         if self.eval_data_collator is None:
             return super().get_eval_dataloader(eval_dataset)
 
@@ -527,15 +224,10 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
             self.data_collator = original_collator
 
     def _transcription_loss(self, logits, labels, num_items_in_batch, label_smoothing):
-        # Until the Whisper model loss is updated to use the new Transfomers loss infrastruture,
-        # it suffers from  bug in how grad acc steps loss is calculated. This is a workaround.
-        # See https://huggingface.co/blog/gradient_accumulation
+        # Workaround for a grad-accumulation loss bug; see https://huggingface.co/blog/gradient_accumulation
         vocab_size = logits.shape[2]
         reduction = "sum" if num_items_in_batch is not None else "mean"
-        loss_fct = torch.nn.CrossEntropyLoss(
-            reduction=reduction, label_smoothing=label_smoothing
-        )
-        # move labels to correct device to enable PP
+        loss_fct = torch.nn.CrossEntropyLoss(reduction=reduction, label_smoothing=label_smoothing)
         labels = labels.to(logits.device)
 
         loss = loss_fct(logits.view(-1, vocab_size), labels.reshape(-1))
@@ -545,11 +237,7 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
         return loss
 
     def _teacher_kl(self, student_logits, teacher_logits, labels):
-        """Mean per-token KL(teacher || student) over the tokens that carry loss.
-
-        Masking to the scored tokens keeps the padding and the prompt prefix - which are
-        already excluded from the cross entropy - from dominating the penalty.
-        """
+        """Mean per-token KL(teacher || student), masked to the tokens that carry loss."""
         scored = labels.to(student_logits.device) != -100
         temperature = self.kd_temperature
 
@@ -562,16 +250,12 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
         kl = torch.nn.functional.kl_div(
             student_log_probs, teacher_log_probs, log_target=True, reduction="batchmean"
         )
-
-        # Hinton's T^2 keeps the distillation gradient scale comparable across temperatures
-        return (temperature**2) * kl
+        return (temperature**2) * kl  # Hinton's T^2, keeps gradient scale comparable across T
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels")
         try:
             outputs = model(**inputs)
-            # Both regularizers are training-only, so eval loss stays plain cross entropy
-            # and remains comparable across runs with different smoothing/KD settings.
             loss = self._transcription_loss(
                 outputs.logits,
                 labels,
@@ -583,10 +267,7 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
                 self._loss_steps += 1
 
             if self.teacher_model is not None and self.kd_weight > 0 and model.training:
-                # A reduced-precision teacher will not accept the full precision features the
-                # collator produces, so match them to its weights explicitly rather than rely
-                # on an ambient autocast region being active. Integer inputs - the decoder
-                # prefix - must be left alone.
+                # Match teacher dtype explicitly rather than rely on ambient autocast.
                 teacher_inputs = {
                     name: value.to(self.teacher_dtype) if torch.is_floating_point(value) else value
                     for name, value in inputs.items()
@@ -602,17 +283,8 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs, start_time=None):
-        # train/loss folds together the smoothed cross entropy and the KL penalty, which
-        # leaves a long unattended run undiagnosable - a rising total could be either the
-        # model fitting worse or the teacher penalty taking over. Report both terms.
-        # compute_loss normalizes the cross entropy by the token count of the WHOLE
-        # accumulation window, so its per-micro-batch values sum to one true per-token loss
-        # per optimizer step. Averaging them over micro-batches would report that value
-        # divided by the accumulation setting, so two runs that fit identically would print
-        # different numbers purely because their accumulation differs. Scale back to per
-        # optimizer step. The KL is already a per-token mean over its own micro-batch and
-        # needs no such correction - which is also why kd_share has to be formed from the
-        # corrected cross entropy, not the raw running total.
+        # Logs ce/kd_kl separately (a rising train/loss alone can't say which grew), scaled
+        # to per-optimizer-step so it's comparable across different grad_accum settings.
         if self._loss_steps:
             optimizer_steps = self._loss_steps / self.args.gradient_accumulation_steps
             cross_entropy = self._ce_total / optimizer_steps
@@ -629,365 +301,9 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
         super().log(logs, start_time)
 
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Train a Whisper model with custom datasets.")
-    parser.add_argument(
-        "--train_datasets",
-        nargs="*",
-        help="Dataset(s) to train on. Format: dataset_name[:split_name]",
-    )
-    parser.add_argument(
-        "--target_language", type=str, default="hebrew", help="The target training language (Only a single language training is currently supported)"
-    )
-    parser.add_argument("--save_processed", help="Dataset name to save processed data (will save both train and eval)")
-    parser.add_argument(
-        "--include_timestamps_prob",
-        type=float,
-        default=0.5,
-        help="Probability to include timestamps with a sample (This might be a synthetic augmentation or an existing transcription timestamps)",
-    )
-    parser.add_argument(
-        "--include_prev_text_prob",
-        type=float,
-        default=0.5,
-        help="Probability to include previous text with a sample only when prev transcript is present on the sample",
-    )
-    parser.add_argument(
-        "--inject_synthetic_timestamps",
-        help="If timestamps are to be included with a sample but not provided, a start+end timestamp token will be injected",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--audio_shift_augmentation",
-        help="When timestamps are injected, also randomize shift augmentation on it",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--resample_augmentation",
-        help="Simulate low-quality audio by downsampling to --resample_target_hz and back",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--resample_target_hz",
-        type=int,
-        default=8000,
-        help="Target sample rate for the resample augmentation round-trip (default: 8000)",
-    )
-    parser.add_argument(
-        "--resample_prob",
-        type=float,
-        default=0.6,
-        help="Probability of applying resample augmentation to each sample (default: 0.6)",
-    )
-    parser.add_argument(
-        "--use_preprocessed",
-        nargs="+",
-        help="Dataset name to load preprocessed data from (either local path or remote dataset)",
-    )
-    parser.add_argument(
-        "--use_preprocessed_probs", nargs="+", type=float, help="Probability of using preprocessed data"
-    )
-    parser.add_argument(
-        "--ds_processor_proc_num", type=int, default=1, help="Number of parallel processors for datasets preparation"
-    )
-    parser.add_argument("--model_name", default="openai/whisper-large-v2", help="Name of the model to train")
-    parser.add_argument(
-        "--output_model_name",
-        default=None,
-        help="Name of the fine-tuned model to generate. Also used as the run tracker (e.g. "
-        "wandb) run name (--run_name is a deprecated no-op, see its help), so a run is "
-        "always trivially matched to its local output dir/checkpoints. If omitted, a name "
-        "is generated from the run's hyperparameters (e.g. 'lv3-mix-na-b32-kd0.1'). Either "
-        "way, if that name already exists as a local output dir, '_2', '_3', etc. is "
-        "appended rather than overwriting it - unless --resume_from_checkpoint is set, in "
-        "which case the name is used as-is so resuming finds the existing checkpoints.",
-    )
-    parser.add_argument("--hf_org_name", default="ivrit-ai", help="Name of HF Org to push the model to")
-    parser.add_argument("--skip_push_to_hub", action="store_true", help="Don't push result model to hub")
-    parser.add_argument(
-        "--eval_datasets",
-        nargs="*",
-        help="Reference dataset(s) for evaluation. Format: dataset_name[:split_name]",
-    )
-    parser.add_argument(
-        "--save_only_model", action="store_true", default=False, help="Save only the model without optimizer state"
-    )
-    parser.add_argument(
-        "--max_checkpoints_to_keep",
-        type=int,
-        default=None,
-        help="Maximum number of checkpoints to keep during training",
-    )
-    parser.add_argument(
-        "--resume_from_checkpoint", action="store_true", help="Try and resuming for last saved checkpoint"
-    )
-    parser.add_argument(
-        "--resume_from_checkpoint_path", type=str, help="Path to checkpoint to resume from", default=None
-    )
-    parser.add_argument("--save_steps", type=int, default=500, help="Number of steps between each model save/upload.")
-    parser.add_argument(
-        "--ignore_data_skip", action="store_true", help="Ignore data skip when resuming from checkpoint"
-    )
-    parser.add_argument(
-        "--mixed_precision",
-        choices=["bf16", "fp16", "tf32", None],
-        default=None,
-        help="Mixed precision mode for training",
-    )
-    parser.add_argument(
-        "--attn_implementation",
-        default=None,
-        choices=["sdpa"],
-        help="Attention implementation to use (only 'sdpa' available)",
-    )
-    parser.add_argument("--use_qlora", action="store_true", help="Use QLoRA for training")
-    parser.add_argument(
-        "--gradient_checkpointing",
-        action="store_true",
-        help="Recompute activations during the backward pass instead of storing them. "
-        "Trades roughly 30%% more compute for a large drop in activation memory, which is "
-        "what caps the per-device batch size on a single accelerator",
-    )
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
-    # Transformers gives warmup_steps precedence whenever it is > 0, which silently
-    # discarded warmup_ratio. Accept exactly one and translate it in main().
-    warmup_group = parser.add_mutually_exclusive_group()
-    warmup_group.add_argument(
-        "--warmup_ratio", type=float, help="Fraction of total training steps spent warming up (default: 0.1)"
-    )
-    parser.add_argument("--num_train_epochs", type=int, default=10, help="Number of training epochs")
-    parser.add_argument(
-        "--max_steps", type=int, default=-1, help="How many steps to train for - overrides num_train_epochs"
-    )
-    warmup_group.add_argument(
-        "--warmup_steps", type=int, help="Absolute number of warmup steps, instead of --warmup_ratio"
-    )
-    parser.add_argument(
-        "--lr_scheduler_type", type=str, default="constant_with_warmup", help="Learning rate scheduler type"
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps", type=int, default=2, help="Number of gradient accumulation steps"
-    )
-    parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay (AdamW L2 regularization)")
-    parser.add_argument(
-        "--label_smoothing",
-        type=float,
-        default=0.0,
-        help="Label smoothing for the transcription cross entropy",
-    )
-    parser.add_argument(
-        "--kd_weight",
-        type=float,
-        default=0.0,
-        help="Weight of the KL penalty against a frozen teacher (0 disables distillation)",
-    )
-    parser.add_argument(
-        "--kd_teacher_model",
-        type=str,
-        default=None,
-        help="Teacher to regularize towards. Defaults to --model_name, which makes the "
-        "penalty a trust region around the checkpoint being fine-tuned",
-    )
-    parser.add_argument(
-        "--kd_temperature", type=float, default=1.0, help="Softmax temperature for the KL penalty"
-    )
-    parser.add_argument(
-        "--eval_steps", type=int, help="Number of steps between two evals, if not specified defaults to logging_steps."
-    )
-    parser.add_argument(
-        "--predict_wer", action="store_true", help="Use WER as the metric for best model instead of loss"
-    )
-    parser.add_argument("--max_eval_set_size", type=int, help="Maximum number of entries to fetch from eval dataset.")
-
-    parser.add_argument("--per_device_train_batch_size", type=int, default=16, help="Per-device train batch size.")
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=16, help="Per-device eval batch size.")
-
-    parser.add_argument(
-        "--no_report", action="store_true", help="Disable reporting to run trackers (e.g. wandb)."
-    )
-    parser.add_argument(
-        "--run_name",
-        default=None,
-        help="Deprecated, accepted for backward compatibility only: run_name always mirrors "
-        "--output_model_name now (see its help), so this has no effect. Kept as a no-op flag "
-        "so older commands that pass it (typically set equal to --output_model_name) don't "
-        "fail to parse.",
-    )
-    parser.add_argument("--logging_steps", type=int, default=500, help="Number of step between each log")
-
-    pg = parser.add_argument_group("noise augmentation")
-    pg.add_argument(
-        "--noise_config",
-        type=str,
-        default=None,
-        metavar="YAML_PATH",
-        help="Path to a YAML file with noise augmentation settings - the single source of "
-             "defaults for every noise_* setting below; --noise_<key> flags (e.g. "
-             "--noise_apply_prob) override one key at a time without editing the file. "
-             "With --use_preprocessed, noise is mixed live in the mel domain by the data "
-             "collator (fresh per batch, so it varies across epochs). With --train_datasets, "
-             "noise is instead baked once into the mel features at dataset-prep time "
-             "(same realization every epoch). Eval always uses a noise-free collator "
-             "regardless of this setting. See preprocess/noise_config.yaml for an annotated example.",
-    )
-    pg.add_argument(
-        "--noise_dir",
-        type=str,
-        default=None,
-        metavar="PATH",
-        help="Override the noise_dir from --noise_config without editing the YAML.",
-    )
-    # One override flag per --noise_config key, all defaulting to None ("use whatever the
-    # YAML says"). The YAML stays the single source of defaults; these are for a one-off
-    # change (a quick sweep, a debugging run) without editing or forking the file. Every
-    # flag here requires --noise_augmentation, same as --noise_dir above - see the check
-    # in main().
-    pg.add_argument("--noise_apply_prob", type=float, default=None, help="Override apply_prob.")
-    pg.add_argument(
-        "--noise_snr_db_range", type=float, nargs=2, default=None, metavar=("MIN_DB", "MAX_DB"),
-        help="Override snr_db_range.",
-    )
-    pg.add_argument(
-        "--noise_num_noises_range", type=int, nargs=2, default=None, metavar=("MIN", "MAX"),
-        help="Override num_noises_range.",
-    )
-    pg.add_argument("--noise_gain_jitter_db", type=float, default=None, help="Override gain_jitter_db.")
-    pg.add_argument(
-        "--noise_coverage_frac_range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
-        help="Override coverage_frac_range.",
-    )
-    pg.add_argument(
-        "--noise_burst_len_frac_range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
-        help="Override burst_len_frac_range.",
-    )
-    pg.add_argument("--noise_perturb_prob", type=float, default=None, help="Override perturb_prob.")
-    pg.add_argument(
-        "--noise_time_stretch_range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
-        help="Override time_stretch_range.",
-    )
-    pg.add_argument(
-        "--noise_pitch_shift_semitone_range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"),
-        help="Override pitch_shift_semitone_range.",
-    )
-    pg.add_argument(
-        "--noise_simulate_radio_channel", action=argparse.BooleanOptionalAction, default=None,
-        help="Override simulate_radio_channel.",
-    )
-    pg.add_argument(
-        "--noise_radio_band_hz", type=float, nargs=2, default=None, metavar=("LOW_HZ", "HIGH_HZ"),
-        help="Override radio_band_hz.",
-    )
-    pg.add_argument(
-        "--noise_filter_signal_too", action=argparse.BooleanOptionalAction, default=None,
-        help="Override filter_signal_too.",
-    )
-    pg.add_argument("--noise_radio_clip_drive", type=float, default=None, help="Override radio_clip_drive.")
-    pg.add_argument(
-        "--noise_augmentation",
-        action="store_true",
-        default=False,
-        help="Enable live noise augmentation during training. Requires --noise_config.",
-    )
-    return parser.parse_args()
-
-
-def _load_noise_config(yaml_path: str) -> dict:
-    """Load noise augmentation kwargs from a YAML file.
-
-    Keys can be written with or without the 'noise_' prefix — both are accepted.
-    Lists are converted to tuples. Defaults live in noise_config.yaml itself.
-    """
-    import yaml
-
-    with open(yaml_path) as f:
-        raw = yaml.safe_load(f) or {}
-
-    cfg = {}
-    for key, val in raw.items():
-        canonical = key if key.startswith("noise_") else f"noise_{key}"
-        cfg[canonical] = tuple(val) if isinstance(val, list) else val
-
-    if not cfg.get("noise_dir"):
-        raise ValueError("noise_config YAML must include 'noise_dir'")
-
-    return cfg
-
-
-# Every key --noise_config accepts, each with a matching --noise_<key> CLI flag (see
-# parse_arguments) that overrides it when explicitly passed. Args and YAML keys share this
-# exact name, so the merge in main() is a plain getattr/dict-set - no separate mapping needed.
-_NOISE_CONFIG_OVERRIDE_KEYS = [
-    "noise_dir",
-    "noise_apply_prob",
-    "noise_snr_db_range",
-    "noise_num_noises_range",
-    "noise_gain_jitter_db",
-    "noise_coverage_frac_range",
-    "noise_burst_len_frac_range",
-    "noise_perturb_prob",
-    "noise_time_stretch_range",
-    "noise_pitch_shift_semitone_range",
-    "noise_simulate_radio_channel",
-    "noise_radio_band_hz",
-    "noise_filter_signal_too",
-    "noise_radio_clip_drive",
-]
-
-
-def _resolve_noise_kwargs(args) -> dict:
-    """Resolve the effective noise-augmentation kwargs: YAML defaults, then per-key CLI
-    overrides layered on top. The YAML stays the single source of defaults - the CLI flags
-    (--noise_<key>, one per _NOISE_CONFIG_OVERRIDE_KEYS entry, all default None) are for a
-    one-off change (a quick sweep, a debugging run) without editing or forking the file.
-
-    Returns {} when --noise_augmentation is off. Raises if any --noise_<key> override was
-    passed without --noise_augmentation - silently ignoring it would be worse than erroring,
-    since it looks like it should have done something.
-    """
-    if not args.noise_augmentation:
-        set_without_augmentation = [
-            key for key in _NOISE_CONFIG_OVERRIDE_KEYS if getattr(args, key) is not None
-        ]
-        if set_without_augmentation:
-            flags = ", ".join(f"--{key}" for key in set_without_augmentation)
-            raise ValueError(f"{flags} require --noise_augmentation to also be set")
-        return {}
-
-    if not args.noise_config:
-        raise ValueError("--noise_augmentation requires --noise_config to also be set")
-    noise_kwargs = _load_noise_config(args.noise_config)
-
-    # nargs=2 flags arrive as lists; match _load_noise_config's own tuple convention.
-    overridden = []
-    for key in _NOISE_CONFIG_OVERRIDE_KEYS:
-        value = getattr(args, key)
-        if value is not None:
-            noise_kwargs[key] = tuple(value) if isinstance(value, list) else value
-            overridden.append(key)
-
-    noise_kwargs["noise_augmentation"] = True
-    print(f"Noise augmentation enabled (config: {args.noise_config})")
-    if overridden:
-        print(f"  CLI overrides: {', '.join(f'{k}={noise_kwargs[k]}' for k in overridden)}")
-    print(f"  noise_dir: {noise_kwargs['noise_dir']}")
-    return noise_kwargs
-
-
 def _init_run_tracking(args, noise_kwargs: dict) -> None:
-    """Pre-init the wandb run with the full effective config, so the run's Overview/Config
-    tab shows every setting that actually shaped this run - not just what Seq2SeqTrainer's
-    own WandbCallback captures (TrainingArguments fields only) plus a raw --noise_config
-    path string. wandb already auto-captures the launch command verbatim (see
-    wandb-metadata.json in any past run dir) - that solves "what command produced this run"
-    but not "what does --noise_config path/to/file.yaml actually mean", since the YAML's
-    contents never reach the command line at all.
-
-    Calling wandb.init() here (before the Trainer exists) is the documented way to add
-    custom config: WandbCallback.setup() checks `if wandb.run is None` before calling its
-    own wandb.init(), and just layers TrainingArguments on top of whatever run/config
-    already exists via `config.update(..., allow_val_change=True)` - so this doesn't fight
-    or get overwritten by the Trainer's own reporting, it's additive.
-    """
+    """Pre-inits wandb with the full config (incl. resolved noise YAML) before the Trainer
+    exists, so its own WandbCallback layers TrainingArguments onto it instead of replacing it."""
     if args.no_report:
         return
 
@@ -997,22 +313,15 @@ def _init_run_tracking(args, noise_kwargs: dict) -> None:
         print("wandb not installed - skipping config pre-logging (pass --no_report to silence this).")
         return
 
-    # vars(args) covers every CLI flag (dataset specs, augmentation probabilities, KD/label
-    # smoothing settings, etc.) that TrainingArguments doesn't know about and so would
-    # otherwise only ever be visible by re-reading wandb-metadata.json's raw argv dump.
-    # noise_kwargs is nested separately since it's the one thing that ISN'T on the command
-    # line at all - it's the resolved contents of --noise_config's YAML file.
-    config = {**vars(args), "noise": noise_kwargs}
+    config = {**vars(args), "noise": noise_kwargs}  # noise_kwargs nested: not on the command line at all
 
     wandb.init(
-        project=os.getenv("WANDB_PROJECT", "huggingface"),  # same default Trainer's WandbCallback uses
+        project=os.getenv("WANDB_PROJECT", "huggingface"),
         name=args.run_name,
         config=config,
     )
-    # Also attach the exact YAML file to the run's Files tab, so a config edited between
-    # runs is recoverable byte-for-byte, not just as the flattened/tuple-ified values above.
     if args.noise_config:
-        wandb.save(args.noise_config, policy="now")
+        wandb.save(args.noise_config, policy="now")  # exact YAML, recoverable byte-for-byte
 
 
 def main():
@@ -1046,16 +355,12 @@ def main():
         preprocessed_dataset_dicts = []
         for preprocessed in args.use_preprocessed:
             try:
-                # Try to load from disk first
                 dataset_dict = load_from_disk(preprocessed)
             except FileNotFoundError:
-                # If not found on disk, try to load as a remote dataset
                 dataset_dict = load_dataset(preprocessed)
             preprocessed_dataset_dicts.append(dataset_dict)
 
         if len(preprocessed_dataset_dicts) == 1:
-            # Index the list rather than reusing the loop variable above - same object today
-            # only because the loop ran exactly once, which is a trap if the loop ever changes.
             train_set = preprocessed_dataset_dicts[0]["train"]
             eval_set = preprocessed_dataset_dicts[0]["eval"]
         else:
@@ -1067,23 +372,17 @@ def main():
                 [d["train"] for d in preprocessed_dataset_dicts],
                 probabilities=probs,
                 stopping_strategy="all_exhausted",
-                # We set the seed so each distributed process will interleave in the same way
-                # otherwise - the dataloader across each process ends up with different lengths
-                # which screws up the collective synchronization
-                # See https://huggingface.co/docs/accelerate/en/concept_guides/internal_mechanism
+                # Fixed seed so every distributed rank interleaves identically.
                 seed=dataset_shuffle_seed,
             )
             eval_set = interleave_datasets(
                 [d["eval"] for d in preprocessed_dataset_dicts],
                 probabilities=probs,
                 stopping_strategy="all_exhausted",
-                # We set the seed so each distributed process will interleave in the same way
-                # See above.
                 seed=dataset_shuffle_seed,
             )
 
     elif args.save_processed:
-
         if not args.train_datasets or not args.eval_datasets:
             raise ValueError("Both --train_datasets and --eval_datasets must be provided when using --save_processed")
 
@@ -1096,7 +395,7 @@ def main():
         dataset_dict = DatasetDict({"train": train_set, "eval": eval_set})
         dataset_dict.save_to_disk(args.save_processed)
         print(f"Preprocessed datasets saved to {args.save_processed}")
-        return  # Exit after saving preprocessed data
+        return
     else:
         if not args.train_datasets or not args.eval_datasets:
             raise ValueError("Both --train_datasets and --eval_datasets must be provided for training")
@@ -1115,8 +414,6 @@ def main():
         args.output_model_name = generate_run_name(args)
         print(f"--output_model_name not given, auto-generated: {args.output_model_name}")
     if resuming:
-        # Resuming must land in the exact dir the checkpoints already live in - versioning
-        # it here would point the trainer at a fresh, checkpoint-less directory instead.
         if local_dir_exists(args.output_model_name):
             print(f"Resuming into existing output dir: {args.output_model_name}")
     else:
@@ -1124,9 +421,7 @@ def main():
         if deduped != args.output_model_name:
             print(f"Output dir '{args.output_model_name}' already exists, using '{deduped}' instead")
             args.output_model_name = deduped
-    # Always kept identical to output_model_name (--run_name is accepted but a no-op, see
-    # its help) so the wandb run is trivially matched to the local output dir/checkpoints
-    # it corresponds to.
+    # run_name always mirrors output_model_name (--run_name is a deprecated no-op).
     if args.run_name is not None and args.run_name != args.output_model_name:
         print(
             f"--run_name '{args.run_name}' is ignored (deprecated, no-op) - using "
@@ -1138,10 +433,7 @@ def main():
 
     decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
     train_noise_augmenter = preparator.noise_augmenter if args.use_preprocessed else None
-    # Same baked-vs-live duality as noise: with --train_datasets, resample augmentation is
-    # already baked into the dataset by DatasetPreparator, so it must NOT also run live here
-    # (that would double-apply it); with --use_preprocessed there's nothing baked in, so the
-    # live mel-domain approximation is what actually delivers --resample_augmentation.
+    # None when --train_datasets already baked it in; set for the live (--use_preprocessed) path.
     train_resample_prob = (
         args.resample_prob if (args.use_preprocessed and args.resample_augmentation) else None
     )
@@ -1153,10 +445,7 @@ def main():
         resample_prob=train_resample_prob,
         resample_target_hz=args.resample_target_hz,
     )
-    # Eval always gets the clean collator, even when training uses on-the-fly noise/resample
-    # augmentation - otherwise every eval pass measures against a freshly and randomly
-    # re-augmented eval set, which makes WER/loss incomparable across evals and undermines
-    # checkpoint selection / early-stopping decisions.
+    # Eval always gets the clean collator, so WER/loss stay comparable across evals.
     eval_data_collator = (
         DataCollatorSpeechSeq2SeqWithPadding(
             processor=processor,
@@ -1193,7 +482,7 @@ def main():
 
     model.generate = partial(model.generate, language=args.target_language, task="transcribe", use_cache=True)
 
-    # Exactly one warmup form reaches Transformers, so the other cannot silently win
+    # Exactly one warmup form reaches Transformers, so the other can't silently win.
     if args.warmup_steps is not None:
         warmup_steps, warmup_ratio = args.warmup_steps, 0.0
     else:
@@ -1203,12 +492,7 @@ def main():
     teacher_model = None
     if args.kd_weight > 0:
         teacher_name = args.kd_teacher_model or args.model_name
-        # The teacher is frozen and only ever runs forward, so it can be held at whatever
-        # reduced precision the autocast region already computes in - that halves its
-        # footprint and keeps its dtype matching the activations flowing through it even
-        # when autocast is not active. Deriving this from --mixed_precision rather than
-        # exposing a separate flag keeps the two from contradicting each other. tf32 is an
-        # fp32 compute mode, so it correctly maps to full precision here.
+        # Teacher dtype follows --mixed_precision (halves memory; tf32 maps to full precision).
         teacher_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(args.mixed_precision)
         print(
             f"Loading frozen KD teacher: {teacher_name} "
@@ -1218,7 +502,6 @@ def main():
         teacher_model = WhisperForConditionalGeneration.from_pretrained(
             teacher_name, attn_implementation=args.attn_implementation, torch_dtype=teacher_dtype
         )
-        # No generation happens on the teacher - skip the cache it would otherwise build
         teacher_model.config.use_cache = False
     elif args.kd_teacher_model:
         print("Ignoring --kd_teacher_model since --kd_weight is 0")
@@ -1249,40 +532,25 @@ def main():
         greater_is_better=False,
         push_to_hub=(not args.skip_push_to_hub),
         run_name=args.run_name,
-        # Only the final path segment can go in a Hub repo id - output_model_name is often a
-        # full local path (e.g. /Users/Shared/asr/training/lv3-...), and interpolating that
-        # whole path would build an invalid id like "ivrit-ai//Users/Shared/asr/...".
+        # Only the final path segment is valid in a Hub repo id (output_model_name can be a full path).
         hub_model_id=(
             f"{args.hf_org_name}/{Path(args.output_model_name).name}"
             if not args.skip_push_to_hub
             else None
         ),
         remove_unused_columns=False,
-        # Configure mixed precision based on the argument
         bf16=True if args.mixed_precision == "bf16" else None,
         fp16=True if args.mixed_precision == "fp16" else None,
         tf32=True if args.mixed_precision == "tf32" else None,
-        # Configure prediction loss and metric based on predict_wer
         prediction_loss_only=False if args.predict_wer else True,
-        # Configure save_total_limit if max_checkpoints_to_keep is provided
         save_total_limit=args.max_checkpoints_to_keep,
-        # Configure save_only_model
         save_only_model=True if args.save_only_model else None,
         gradient_checkpointing=args.gradient_checkpointing,
-        # Whisper keeps no cache during training, so the non-reentrant implementation is safe
-        # and is the one that composes with the rest of the Trainer machinery.
+        # Whisper keeps no cache during training, so the non-reentrant implementation is safe.
         gradient_checkpointing_kwargs={"use_reentrant": False} if args.gradient_checkpointing else None,
-        # When resuming, skip replaying the already-consumed batches of the interrupted epoch
-        # if asked to. Previously parsed but never forwarded, so --ignore_data_skip did nothing.
         ignore_data_skip=args.ignore_data_skip,
-        # There is not branching in training the Whisper model
-        ddp_find_unused_parameters=False,
-        # This would take longer, but will calculate the loss
-        # with proper averaging across GPUs.
-        # this is important when the dataset samples vary
-        # wildly in the amount of tokens contributing to the loss and
-        # the distribution of those samples is very unbalanced
-        average_tokens_across_devices=True,
+        ddp_find_unused_parameters=False,  # no branching in the Whisper forward pass
+        average_tokens_across_devices=True,  # correct loss averaging when token counts are unbalanced
     )
 
     trainer = WhisperDistillationTrainer(
@@ -1313,7 +581,6 @@ def main():
     print("Start training!")
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
-    # Save the model
     trainer.save_model(args.output_model_name)
 
 

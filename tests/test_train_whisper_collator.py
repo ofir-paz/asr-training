@@ -1,7 +1,8 @@
-"""End-to-end (mocked) tests for train-whisper.py's DataCollatorSpeechSeq2SeqWithPadding:
-the live noise (_mix_mel_noise) and live resample (_resample_mel) mel-domain augmentation
-paths used when --use_preprocessed leaves no raw waveform to augment in the time domain,
-plus the full __call__ batch-collation path exercising both together.
+"""End-to-end (mocked) tests for dataloader.DataCollatorSpeechSeq2SeqWithPadding: the live
+noise (_mix_mel_noise) and live resample (_resample_mel) mel-domain augmentation paths used
+when --use_preprocessed leaves no raw waveform to augment in the time domain, plus the full
+__call__ batch-collation path exercising both together, plus a check that this collator is
+actually what runs inside the real Seq2SeqTrainer machinery.
 
 Uses a real (default-config, no pretrained download) WhisperFeatureExtractor so the mel
 math is exact, and a minimal fake tokenizer (no network/vocab download needed) standing in
@@ -18,7 +19,7 @@ import torch.nn as nn
 import torchaudio
 from transformers import BatchFeature, Seq2SeqTrainingArguments, WhisperFeatureExtractor
 
-from preprocess.augmentation import resample_mel_cutoff_bin
+from training.dataloader import DataCollatorSpeechSeq2SeqWithPadding
 from preprocess.noise_augmentation import NoiseAugmenter
 
 SR = 16000
@@ -82,16 +83,16 @@ def _fake_feature(feat_len, pad_amount=0):
 
 
 class TestMixMelNoise:
-    def test_noop_when_no_augmenter(self, train_whisper_module, fake_processor):
-        collator = train_whisper_module.DataCollatorSpeechSeq2SeqWithPadding(
+    def test_noop_when_no_augmenter(self, fake_processor):
+        collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=fake_processor, decoder_start_token_id=DECODER_START_TOKEN_ID, noise_augmenter=None
         )
         feats = torch.rand(N_MELS, 500)
         assert torch.equal(collator._mix_mel_noise(feats, pad_amount=0), feats)
 
-    def test_changes_features_when_applied(self, train_whisper_module, fake_processor, noise_dir):
+    def test_changes_features_when_applied(self, fake_processor, noise_dir):
         augmenter = NoiseAugmenter(noise_dir=str(noise_dir), target_sampling_rate=SR, apply_prob=1.0)
-        collator = train_whisper_module.DataCollatorSpeechSeq2SeqWithPadding(
+        collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=fake_processor,
             decoder_start_token_id=DECODER_START_TOKEN_ID,
             noise_augmenter=augmenter,
@@ -103,9 +104,9 @@ class TestMixMelNoise:
         assert not torch.allclose(out, feats)
 
     @pytest.mark.parametrize("feat_len", [100, 587, 1500])
-    def test_shape_preserved_across_lengths(self, train_whisper_module, fake_processor, noise_dir, feat_len):
+    def test_shape_preserved_across_lengths(self, fake_processor, noise_dir, feat_len):
         augmenter = NoiseAugmenter(noise_dir=str(noise_dir), target_sampling_rate=SR, apply_prob=1.0)
-        collator = train_whisper_module.DataCollatorSpeechSeq2SeqWithPadding(
+        collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=fake_processor,
             decoder_start_token_id=DECODER_START_TOKEN_ID,
             noise_augmenter=augmenter,
@@ -114,9 +115,7 @@ class TestMixMelNoise:
         out = collator._mix_mel_noise(feats, pad_amount=3000 - feat_len)
         assert out.shape == (N_MELS, feat_len)
 
-    def test_silent_noise_realization_is_skipped_not_amplified(
-        self, train_whisper_module, fake_processor, noise_dir, monkeypatch
-    ):
+    def test_silent_noise_realization_is_skipped_not_amplified(self, fake_processor, noise_dir, monkeypatch):
         """A silent noise realization must add nothing.
 
         Digital silence doesn't round-trip to zero mel power - it lands on the ~1e-10 log
@@ -124,7 +123,7 @@ class TestMixMelNoise:
         flat broadband hiss out of the numerical floor. The near-silence guard must catch it.
         """
         augmenter = NoiseAugmenter(noise_dir=str(noise_dir), target_sampling_rate=SR, apply_prob=1.0)
-        collator = train_whisper_module.DataCollatorSpeechSeq2SeqWithPadding(
+        collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=fake_processor,
             decoder_start_token_id=DECODER_START_TOKEN_ID,
             noise_augmenter=augmenter,
@@ -138,22 +137,22 @@ class TestMixMelNoise:
 
 
 class TestResampleMel:
-    def test_noop_when_disabled(self, train_whisper_module, fake_processor):
-        collator = train_whisper_module.DataCollatorSpeechSeq2SeqWithPadding(
+    def test_noop_when_disabled(self, fake_processor):
+        collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=fake_processor, decoder_start_token_id=DECODER_START_TOKEN_ID, resample_prob=None
         )
         feats = torch.rand(N_MELS, 400)
         assert torch.equal(collator._resample_mel(feats), feats)
 
-    def test_never_applies_when_prob_zero(self, train_whisper_module, fake_processor):
-        collator = train_whisper_module.DataCollatorSpeechSeq2SeqWithPadding(
+    def test_never_applies_when_prob_zero(self, fake_processor):
+        collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=fake_processor, decoder_start_token_id=DECODER_START_TOKEN_ID, resample_prob=0.0
         )
         feats = torch.rand(N_MELS, 400) * 0.5 + 0.2
         assert torch.equal(collator._resample_mel(feats), feats)
 
-    def test_zeroes_high_mel_bins_when_forced(self, train_whisper_module, fake_processor):
-        collator = train_whisper_module.DataCollatorSpeechSeq2SeqWithPadding(
+    def test_attenuates_high_bins_preserves_low_bins_when_forced(self, fake_processor):
+        collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=fake_processor,
             decoder_start_token_id=DECODER_START_TOKEN_ID,
             resample_prob=1.0,
@@ -163,19 +162,17 @@ class TestResampleMel:
         out = collator._resample_mel(feats)
         assert out.shape == feats.shape
         assert torch.isfinite(out).all()
-
-        cutoff = resample_mel_cutoff_bin(N_MELS, SR, 8000)
-        # Above the cutoff, mel power should have collapsed toward the log floor - i.e. be
-        # strictly lower than the untouched value, not merely "different".
-        assert (out[cutoff:, :] < feats[cutoff:, :]).all()
-        # Below the cutoff, left untouched.
-        assert torch.equal(out[:cutoff, :], feats[:cutoff, :])
+        # Attenuation happens in linear power; a uniform log-mel input isn't uniform power,
+        # so just check the expected direction: low bins survive close to untouched, high
+        # bins are pulled toward the log floor (a smaller stored value), not equal to it.
+        assert torch.allclose(out[:5, :], feats[:5, :], atol=0.05)
+        assert (out[70:, :] < feats[70:, :]).all()
 
 
 class TestCollatorCallEndToEnd:
-    def test_batch_with_noise_and_resample_both_enabled(self, train_whisper_module, fake_processor, noise_dir):
+    def test_batch_with_noise_and_resample_both_enabled(self, fake_processor, noise_dir):
         augmenter = NoiseAugmenter(noise_dir=str(noise_dir), target_sampling_rate=SR, apply_prob=1.0)
-        collator = train_whisper_module.DataCollatorSpeechSeq2SeqWithPadding(
+        collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=fake_processor,
             decoder_start_token_id=DECODER_START_TOKEN_ID,
             noise_augmenter=augmenter,
@@ -195,8 +192,8 @@ class TestCollatorCallEndToEnd:
         # The prompt/start token position should be masked to -100, not left as raw ids.
         assert (batch["labels"] == -100).any()
 
-    def test_batch_clean_no_augmentation(self, train_whisper_module, fake_processor):
-        collator = train_whisper_module.DataCollatorSpeechSeq2SeqWithPadding(
+    def test_batch_clean_no_augmentation(self, fake_processor):
+        collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=fake_processor, decoder_start_token_id=DECODER_START_TOKEN_ID
         )
         features = [_fake_feature(300)]
@@ -204,16 +201,16 @@ class TestCollatorCallEndToEnd:
         assert batch["input_features"].shape == (1, N_MELS, 300)
         assert torch.isfinite(batch["input_features"]).all()
 
-    def test_augmented_and_clean_batches_differ(self, train_whisper_module, fake_processor, noise_dir):
+    def test_augmented_and_clean_batches_differ(self, fake_processor, noise_dir):
         """Sanity check that enabling augmentation actually changes what the model sees,
         for an identical input batch."""
         features = [_fake_feature(400)]
 
-        clean_collator = train_whisper_module.DataCollatorSpeechSeq2SeqWithPadding(
+        clean_collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=fake_processor, decoder_start_token_id=DECODER_START_TOKEN_ID
         )
         augmenter = NoiseAugmenter(noise_dir=str(noise_dir), target_sampling_rate=SR, apply_prob=1.0)
-        noisy_collator = train_whisper_module.DataCollatorSpeechSeq2SeqWithPadding(
+        noisy_collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=fake_processor,
             decoder_start_token_id=DECODER_START_TOKEN_ID,
             noise_augmenter=augmenter,
@@ -262,7 +259,7 @@ class TestTrainerWiring:
         self, train_whisper_module, fake_processor, noise_dir
     ):
         augmenter = NoiseAugmenter(noise_dir=str(noise_dir), target_sampling_rate=SR, apply_prob=1.0)
-        collator = train_whisper_module.DataCollatorSpeechSeq2SeqWithPadding(
+        collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=fake_processor,
             decoder_start_token_id=DECODER_START_TOKEN_ID,
             noise_augmenter=augmenter,
@@ -304,10 +301,8 @@ class TestTrainerWiring:
             assert batch["input_features"].shape == (2, N_MELS, 300)
             assert torch.isfinite(batch["input_features"]).all()
 
-    def test_train_dataloader_skips_augmentation_when_disabled(
-        self, train_whisper_module, fake_processor
-    ):
-        collator = train_whisper_module.DataCollatorSpeechSeq2SeqWithPadding(
+    def test_train_dataloader_skips_augmentation_when_disabled(self, train_whisper_module, fake_processor):
+        collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=fake_processor, decoder_start_token_id=DECODER_START_TOKEN_ID
         )
         train_dataset = _ListDataset([_fake_feature(300) for _ in range(4)])
