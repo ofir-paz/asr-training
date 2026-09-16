@@ -1,7 +1,5 @@
-"""The data collator: pads/stacks batches, and (for --use_preprocessed, where no raw
-waveform survives to bake augmentation into ahead of time) applies noise and resample
-augmentation live, in mel-power space, on each batch.
-"""
+"""The data collator: pads/stacks batches, and for --use_preprocessed (no raw waveform to
+bake augmentation into ahead of time) applies noise/resample augmentation live in mel-power space."""
 
 import logging
 from dataclasses import dataclass
@@ -64,13 +62,9 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         return whisper_power_to_log_mel(resampled_power)
 
     def _mix_mel_noise(self, base_features: torch.Tensor, pad_amount: int) -> torch.Tensor:
-        """Live counterpart of noise augmentation: builds the noise as a waveform (the
-        library is waveforms, and burst/pitch/stretch are time-domain ops), then mixes it
-        into the speech in mel-power space since that's all that's available here.
-
-        pad_amount is unused: base_features is already the padding-stripped real content,
-        and the caller re-appends the stored pad value after this returns.
-        """
+        """Live counterpart of noise augmentation: builds the noise as a waveform (burst/
+        pitch/stretch are time-domain ops), then mixes it into speech in mel-power space.
+        pad_amount is unused - the caller re-appends the pad after this returns."""
         if self.noise_augmenter is None:
             return base_features
 
@@ -144,26 +138,13 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"]
 
-        # Labels, represent the input to the decoder
         batch["decoder_input_ids"] = labels[:, :-1]
 
-        # Shift all labels to the left, thus the expected generated label
-        # is at the same index of the generated output id from the decoder
-        # and the loss function would compare them (cross entropy loss in this case)
-        # Note - this means there is no loss calculated for the first "start of transcript" token id
-        # since it is not expected to be predicted but always provided.
-        # The loss is calculated for the task/lang/notimestamp tokens since the model needs to know
-        # to associate them with the proper output
-        # **Warning!** the labels are shifted here, and some version of transformers will assume
-        # they are not if using the default "ForCausalLMLoss"
-        # Once Whisper is updated to use that built-in loss - need to reconsider the collator.
-        # Atm the custom loss function expects this shift to be done here.
+        # Shift left so decoder output i aligns with label i. Warning: some transformers
+        # versions assume labels are NOT pre-shifted when using the default ForCausalLMLoss.
         labels = labels[:, 1:]
         labels_mask = labels_batch.attention_mask[:, 1:]
-
-        # Where we do not need to attend when calculating loss - -100 is the agreed
-        # ignored value for the pytorch loss functions
-        labels = labels.masked_fill(labels_mask.ne(1), -100)
+        labels = labels.masked_fill(labels_mask.ne(1), -100)  # -100 = ignored by the loss
 
         # replace initial prompt tokens with -100 to ignore correctly when computing the loss
         bos_index = torch.argmax((labels == self.decoder_start_token_id).long(), dim=1)

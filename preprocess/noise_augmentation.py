@@ -1,22 +1,6 @@
-"""
-Noise augmentation for ASR fine-tuning.
-
-Design goals (see accompanying discussion):
-- Noise clips are NOT resized/normalized to a fixed length up front. Instead, a random
-  window (or a randomly-rotated loop, if the clip is shorter than the target audio) is
-  extracted at apply-time, so the same small noise library works for any utterance length
-  and yields free variety across epochs.
-- Noise is mixed at a randomized target SNR (dB) rather than a fixed gain, so severity
-  varies across examples. `apply_prob` additionally controls what fraction of examples get
-  noise at all (so the model still sees plenty of clean audio).
-- Everything is driven by a caller-supplied `np.random.Generator` (the same `self.seed`
-  DatasetPreparator already uses), split into a `decide_*` step (cheap, deterministic given
-  the seed state, safe to run before we've resampled/shifted audio) and an `apply` step
-  (does the actual DSP), matching the existing shift-augmentation pattern.
-- Optional light in-family perturbation (gain jitter, optional pitch/time stretch) so the
-  ~70 raw clips don't get reused completely verbatim every time they're picked.
-- Optional radio-channel simulation (bandpass filter, optional soft clipping) since "sounds
-  like radio" is a channel effect on top of, not a substitute for, SNR-based noise mixing.
+"""Noise augmentation for ASR fine-tuning: clips are windowed/looped to length at apply-time
+(not resized upfront) and mixed at a randomized SNR via a caller-supplied RNG, decide/apply
+split like the shift augmentation in preperator.py.
 """
 
 from __future__ import annotations
@@ -72,12 +56,7 @@ def _soft_clip(audio: NDArray[np.float32], drive: float) -> NDArray[np.float32]:
 
 # loops over the noise inside teh window from a random start inside the signal
 def _loop_or_window(clip: NDArray[np.float32], length: int, rng: np.random.Generator) -> NDArray[np.float32]:
-    """Return a segment of exactly `length` samples from `clip`, without resizing the clip itself.
-
-    - If the clip is longer than `length`: take a random contiguous window.
-    - If the clip is shorter: rotate it by a random offset (so the loop seam lands in a
-      different place each time it's picked) and tile it out to `length`.
-    """
+    """A `length`-sample segment of `clip`: a random window if longer, else rotated+tiled."""
     clip_len = clip.shape[-1]
     if clip_len == 0:
         return np.zeros(length, dtype=np.float32)
@@ -114,10 +93,7 @@ def _place_bursts(
         out[start : start + burst_len] += burst
     return out
 
-# target RMS for `other` so mixing it in at this level would hit `snr_db` against `reference_rms`.
-# Domain-agnostic (works for waveform-amplitude RMS or mel-power RMS alike) since it's just the
-# dB->ratio conversion - shared so the waveform-domain (mix_audio_at_snr) and mel-power-domain
-# (train-whisper.py's DataCollator._mix_mel_noise) mixers can't drift apart on this formula.
+# Target RMS for `other` so mixing it in would hit `snr_db` against `reference_rms` (domain-agnostic).
 def snr_target_rms(reference_rms, snr_db: float):
     return reference_rms / (10 ** (snr_db / 20))
 
@@ -126,17 +102,9 @@ def snr_target_rms(reference_rms, snr_db: float):
 def mix_audio_at_snr(
     audio: NDArray[np.float32], noise: NDArray[np.float32], snr_db: float, prevent_clipping: bool = True
 ) -> NDArray[np.float32]:
-    """Mix `noise` into `audio` scaled so the result hits `snr_db` (signal RMS vs noise RMS).
-
-    The actual scaling is delegated to torchaudio.functional.add_noise (torchaudio is
-    already a hard dependency here, via NoiseLibrary's load/resample) rather than
-    re-deriving the dB->ratio math by hand: for equal-length arrays its
-    a = sqrt(||x||^2/||n||^2 * 10^(-SNR/10)) reduces to exactly
-    (audio_rms/noise_rms) * 10^(-snr_db/20) - the same formula this function used to
-    compute directly (verified numerically equal at float32 precision). What's kept here
-    is project policy torchaudio's function doesn't decide for you: skip mixing into a
-    near-silent clip, and prevent post-mix clipping.
-    """
+    """Mix `noise` into `audio` at `snr_db`, via torchaudio.functional.add_noise (verified
+    equivalent to the hand-derived dB formula); adds the near-silence guard and clip
+    prevention that function doesn't do for you."""
     audio_rms = _rms(audio)
     noise_rms = _rms(noise)
 
@@ -162,13 +130,8 @@ def build_noise_waveform(
     target_sampling_rate: int,
     length: int,
 ) -> NDArray[np.float32]:
-    """Realize `decision` (from `NoiseAugmenter.decide_augmentation`) into a single combined
-    noise waveform of `length` samples: pick/perturb/burst-place each decided clip and sum them,
-    pre-SNR-mixing. Shared by `NoiseAugmenter.apply()` (mixes this into a real waveform) and
-    `train-whisper.py`'s live mel-domain collator (feature-extracts this and mixes in mel-power
-    space instead, since it only has mel features for the speech side, not a waveform) - both
-    need the exact same "what does the noise itself sound like" step.
-    """
+    """Realizes `decision` into one combined noise waveform, pre-SNR-mixing. Shared by the
+    waveform path (apply()) and the live mel-domain collator."""
     mixed_noise = np.zeros(length, dtype=np.float32)
 
     for idx, gain_db, offset_seed, stretch, pitch, coverage_frac in zip(
@@ -202,11 +165,8 @@ def build_noise_waveform(
 
 
 class NoiseLibrary:
-    """Loads and caches a directory of noise files, resampled to a single target sample rate.
-
-    Loaded eagerly (not per-worker-lazy) at construction time so behavior is predictable
-    when this object gets pickled out to `dataset.map(num_proc=...)` workers.
-    """
+    """Loads/caches noise files at a target sample rate, eagerly (not lazily) so behavior is
+    predictable once pickled out to dataset.map(num_proc=...) workers."""
 
     def __init__(self, noise_dir: str, target_sampling_rate: int, extensions: tuple[str, ...] = _AUDIO_EXTENSIONS):
         self.noise_dir = Path(noise_dir)
@@ -238,40 +198,8 @@ class NoiseLibrary:
 
 @dataclass
 class NoiseAugmenter:
-    """
-    On-the-fly noise augmentation. Usage mirrors the shift-augmentation pattern:
-
-        decision = augmenter.decide_augmentation(rng)   # cheap, called during "decide" step
-        audio = augmenter.apply(audio, decision)          # actual DSP, called during "apply" step
-
-    Parameters
-    ----------
-    noise_dir : directory containing your noise clips (subfolders ok).
-    apply_prob : fraction of examples that get any noise at all. Keep this < 1.0 so the
-        model still sees clean audio and doesn't learn to expect noise always.
-    snr_db_range : (min, max) target SNR in dB, sampled uniformly per example. Lower = more
-        noise. For radio-band robustness you generally want a fairly wide range (e.g.
-        0-25 dB) so the model handles both clean and heavily-degraded channel conditions,
-        rather than one fixed severity.
-    num_noises_range : (min, max) how many noise clips to layer together per example
-        (inclusive). >1 is useful if you want e.g. hiss + intermittent static together;
-        (1, 1) just picks one clip.
-    gain_jitter_db : each selected clip additionally gets a random +/- gain jitter (dB)
-        before SNR scaling, purely to vary the character of the same clip across picks.
-    time_stretch_range / pitch_shift_semitone_range : optional light in-family perturbation
-        of the picked noise segment (requires `librosa`; silently skipped if unavailable).
-        Keep these ranges small (defaults are already conservative) - the goal is "sounds
-        like a slightly different take of the same noise", not a new noise.
-    perturb_prob : probability of applying the stretch/pitch perturbation to a given picked
-        clip (so not every application is perturbed).
-    simulate_radio_channel : if True, bandpass-filters the *noise* (and, if `filter_signal_too`,
-        the mixed signal) to the given band, and optionally applies soft clipping - to
-        approximate the frequency response / compression of a radio channel rather than just
-        adding radio-recorded noise on top of full-bandwidth speech.
-    radio_band_hz : bandpass cutcallback frequencies for the above.
-    radio_clip_drive : >1.0 enables tanh soft-clipping (crude AGC/compression stand-in);
-        1.0 disables it.
-    """
+    """On-the-fly noise augmentation: decide_augmentation(rng) picks the params, apply(audio,
+    decision) does the DSP. Field meanings are documented in preprocess/noise_config.yaml."""
 
     noise_dir: str 
     target_sampling_rate: int

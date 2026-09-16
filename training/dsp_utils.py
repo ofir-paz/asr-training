@@ -9,10 +9,7 @@ import numpy as np
 import torch
 from scipy.signal import butter, freqz
 
-# Below this, a mel-power array is silence as far as SNR mixing is concerned. Whisper's log
-# floor (1e-10) maps back to a power RMS floor of ~1e-5; this sits just above it so the check
-# can actually fire (see preprocess/noise_augmentation.py's own, differently-calibrated,
-# waveform-domain _SILENCE_RMS_THRESHOLD - the two floors are not the same value).
+# Mel-power silence floor (~1e-5); NOT the same value as noise_augmentation.py's waveform-domain one.
 MEL_SILENCE_RMS_THRESHOLD = 2e-5
 
 
@@ -36,12 +33,9 @@ def mel_power_rms(power: torch.Tensor) -> torch.Tensor:
 
 @lru_cache(maxsize=8)
 def _resample_power_response(n_mels: int, sample_rate: int, target_hz: int, order: int = 4) -> np.ndarray:
-    """Per-mel-bin power attenuation approximating resample_augment()'s downsample+upsample
-    round trip: a real filter's frequency response, not a brick-wall cutoff - zeroing bins
-    outright corresponds to convolving with a sinc in the time domain and rings. Each of the
-    two resample passes (down, up) contributes one |H(f)|^2 in power, via the same
-    convolution-theorem logic as _bandpass_filter/butter elsewhere in this codebase.
-    """
+    """Per-mel-bin power attenuation approximating resample_augment()'s round trip: a real
+    filter's response (not a brick-wall cutoff, which rings in the time domain), applied
+    twice (once per resample pass) via Hadamard product."""
     nyquist = sample_rate / 2
     cutoff = min(target_hz / 2, nyquist * 0.999) / nyquist
     b, a = butter(order, cutoff, btype="low")

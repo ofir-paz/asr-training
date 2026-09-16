@@ -1,15 +1,5 @@
-"""Derives a short, descriptive run/output name from train-whisper.py's own CLI args.
-
-There's no off-the-shelf library for this: W&B/MLflow/etc. only generate random
-adjective-noun names (e.g. "silly-golden-otter") when you don't supply one - they have
-no notion of *this project's* hyperparameters. The naming convention actually used for
-past runs (e.g. "lv3-mix-na-b32-kd-low-smooth") is a hand-picked project-specific
-convention, so this reproduces it as code: one short token per setting that meaningfully
-changes what the run *is* (model, dataset composition, which augmentations/regularizers
-are on). Where the original convention used a vague qualitative bucket ("low"), this
-uses the actual value instead (e.g. "kd0.1") so two differently-tuned runs can't collide
-on the same generated name.
-"""
+"""Derives a run/output name like 'lv3-mix-na-b32-kd0.1' from train-whisper.py's CLI args -
+no off-the-shelf library does this (W&B/MLflow only generate random adjective-noun names)."""
 
 from __future__ import annotations
 
@@ -48,10 +38,8 @@ def _fmt_num(x: float) -> str:
 
 
 def generate_run_name(args) -> str:
-    """Build a name like 'lv3-mix-na-b32-kd0.1-sm0.1' from the args that define what
-    this run actually is. Called when --output_model_name is omitted; also used as the
-    wandb run name (train-whisper.py keeps the two in sync, no separate --run_name).
-    """
+    """Builds a name from the args that define what this run actually is, for when
+    --output_model_name is omitted."""
     tokens = [_model_shortcode(args.model_name)]
 
     dataset_specs = list(args.train_datasets or args.use_preprocessed or [])
@@ -85,12 +73,8 @@ def generate_run_name(args) -> str:
 
 
 def dedupe_name(name: str, exists_fn: Callable[[str], bool]) -> str:
-    """Append _2, _3, ... until `exists_fn(candidate)` is False.
-
-    Applied both to auto-generated names and to explicitly-given ones - an explicit
-    --output_model_name that collides with an existing output dir gets versioned too
-    rather than silently overwriting it.
-    """
+    """Appends _2, _3, ... until exists_fn(candidate) is False - for auto-generated and
+    explicitly-given names alike, so neither silently overwrites an existing dir."""
     if not exists_fn(name):
         return name
     i = 2
