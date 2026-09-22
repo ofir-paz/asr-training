@@ -1,71 +1,123 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
-import argparse
+import logging
+import os
 import re
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, List, Union
+from pathlib import Path
+from typing import Callable, List
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logging.getLogger("preprocess.preperator").setLevel(logging.INFO)
+logging.getLogger(__name__).setLevel(logging.INFO)
+
+logger = logging.getLogger(__name__)
 
 import evaluate
 import torch
 from datasets import DatasetDict, interleave_datasets, load_dataset, load_from_disk, ReadInstruction
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
-    BatchFeature,
     BitsAndBytesConfig,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
     WhisperForConditionalGeneration,
     WhisperProcessor,
 )
-from transformers.modeling_outputs import Seq2SeqLMOutput
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 
+from training.dataloader import DataCollatorSpeechSeq2SeqWithPadding
+from training.parser import _resolve_noise_kwargs, parse_arguments
 from preprocess.preperator import (
     DatasetPreparator,
     process_datasets,
     whisper_max_target_positions,
 )
+from training.run_naming import dedupe_name, generate_run_name, local_dir_exists
 
-# Split on : but allow : inside [] for the HF split slicing syntax
-# https://huggingface.co/docs/datasets/loading#slice-splits
+# Splits on ":" but not inside "[...]" - HF's split-slicing syntax.
 dataset_spec_split_pattern = r":(?=(?:[^\[\]]|\[[^\[\]]*\])*$)"
+
+# Column names some datasets use instead of "transcript" (renaming is metadata-only).
+transcript_column_aliases = ["sentence", "text", "transcription"]
+
+
+def normalize_transcript_column(dataset, dataset_name):
+    if "transcript" in dataset.features:
+        return dataset
+
+    for alias in transcript_column_aliases:
+        if alias in dataset.features:
+            print(f"{dataset_name}: using column '{alias}' as 'transcript'")
+            return dataset.rename_column(alias, "transcript")
+
+    raise ValueError(
+        f"{dataset_name}: no transcript column found "
+        f"(tried 'transcript', {transcript_column_aliases})"
+    )
+
+
+@dataclass
+class DatasetRowFilter:
+    """A quality rule; `columns` scopes it so filtering doesn't decode audio."""
+
+    columns: List[str]
+    keep: Callable[..., bool]
+
+
+# Per-dataset quality rules not part of the shared schema.
+dataset_row_filters = {
+    "ivrit-ai/crowd-transcribe-v5": DatasetRowFilter(
+        columns=["extra_data"],
+        keep=lambda extra_data: not any(
+            extra_data[flag]
+            for flag in ("skipped", "unintelligible", "foreign_language", "noisy", "multiple_speakers")
+        ),
+    ),
+}
+
+
+def apply_dataset_row_filter(dataset, dataset_name):
+    row_filter = dataset_row_filters.get(dataset_name)
+    if row_filter is None:
+        return dataset
+
+    filtered = dataset.filter(row_filter.keep, input_columns=row_filter.columns)
+    print(
+        f"{dataset_name}: quality filter dropped "
+        f"{dataset.num_rows - filtered.num_rows} of {dataset.num_rows} rows"
+    )
+    return filtered
 
 
 def load_datasets(dataset_specs):
     datasets = []
     for spec in dataset_specs:
         parts = re.split(dataset_spec_split_pattern, spec)
-
         dataset_name = parts[0]
         split = parts[1] if len(parts) == 2 else "train"
 
-        
         try:
             dataset = load_dataset(dataset_name, split=split)
             if dataset.builder_name == "json" and not "transcript" in dataset.features:
-                print(f"Assumed dataset format mis-detection. Attempting to load. using `load_from_disk` instead. (See comments in code)")
+                print("Assumed dataset format mis-detection. Attempting to load using `load_from_disk` instead.")
                 raise ValueError("Dataset format mis-detection.")
-        
-        # Local datasets, could suffer from a bug where there are more ".json" files
-        # than ".arrow" files which leads to a mis-detection of the dataset format.
-        # The "load_from_disk" API can get around this problem since it's designed to load
-        # such locally stored dataset generated using "save_to_disk"
-        except:
+        except Exception:  # local dataset misdetected as remote; scoped so Ctrl-C isn't swallowed
             dataset = load_from_disk(dataset_name)
-            
-            # But, we want to support the flexible "split instruction" syntax like load_dataset provides.
-            # Hf made this extremely hard, by hiding the parsing and results inside a wrapped internal class.
-            # Why? why HF ?!
+
+            # Support load_dataset's split-slicing syntax here too.
             read_instruction = ReadInstruction.from_spec(split)
             actual_ri_data = read_instruction._relative_instructions[0]
             slice_units = actual_ri_data.unit
-            # We won't go that crazy - only support "abs" units (not pct syntax)
-            if slice_units != 'abs':
-                # This is such shame - HF please fix this.
+            if slice_units != 'abs':  # only "abs" units supported, not pct syntax
                 raise ValueError(f'Unable to support the split definition: ${split} - please read the code for more details.')
-            
+
             split_name = actual_ri_data.splitname
             from_entry = actual_ri_data.from_
             to_entry = actual_ri_data.to
@@ -77,75 +129,16 @@ def load_datasets(dataset_specs):
             if to_entry is not None:
                 dataset = dataset.take(to_entry - from_entry)
 
-        datasets.append(dataset)
+        dataset = normalize_transcript_column(dataset, dataset_name)
+        datasets.append(apply_dataset_row_filter(dataset, dataset_name))
     return datasets
-
-
-@dataclass
-class DataCollatorSpeechSeq2SeqWithPadding:
-    processor: Any
-    decoder_start_token_id: int
-
-    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        # Ensure input_features are decompressed if needed:
-        input_features = []
-        for feature in features:
-            pad_amount = feature.get("pad_amount", 0)
-            if pad_amount > 0:
-                pad_value = feature["pad_value"]  # (d)
-                pad_tensor = torch.tensor([pad_value] * pad_amount).T  # (d, pad_amount)
-                base_features = torch.tensor(feature["input_features"])  # (d, feat_len)
-                final_features = torch.concatenate([base_features, pad_tensor], dim=-1)  # (d, feat_len + pad_amount)
-                input_features.append(final_features)
-            else:
-                input_features.append(torch.tensor(feature["input_features"]))
-
-        batch = BatchFeature({"input_features": torch.stack(input_features)})
-
-        label_features = [{"input_ids": feature["labels"]} for feature in features]
-        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
-
-        labels = labels_batch["input_ids"]
-
-        # Labels, represent the input to the decoder
-        batch["decoder_input_ids"] = labels[:, :-1]
-
-        # Shift all labels to the left, thus the expected generated label
-        # is at the same index of the generated output id from the decoder
-        # and the loss function would compare them (cross entropy loss in this case)
-        # Note - this means there is no loss calculated for the first "start of transcript" token id
-        # since it is not expected to be predicted but always provided.
-        # The loss is calculated for the task/lang/notimestamp tokens since the model needs to know
-        # to associate them with the proper output
-        # **Warning!** the labels are shifted here, and some version of transformers will assume
-        # they are not if using the default "ForCausalLMLoss"
-        # Once Whisper is updated to use that built-in loss - need to reconsider the collator.
-        # Atm the custom loss function expects this shift to be done here.
-        labels = labels[:, 1:]
-        labels_mask = labels_batch.attention_mask[:, 1:]
-
-        # Where we do not need to attend when calculating loss - -100 is the agreed
-        # ignored value for the pytorch loss functions
-        labels = labels.masked_fill(labels_mask.ne(1), -100)
-
-        # replace initial prompt tokens with -100 to ignore correctly when computing the loss
-        bos_index = torch.argmax((labels == self.decoder_start_token_id).long(), dim=1)
-        bos_index = torch.where(bos_index > 0, bos_index + 1, bos_index)
-        prompt_mask = torch.arange(labels.shape[1]) < bos_index[:, None]
-        labels = torch.where(prompt_mask, -100, labels)
-
-        batch["labels"] = labels
-
-        return batch
 
 
 def compute_metrics(pred, processor, metric, normalizer):
     pred_ids = pred.predictions
     label_ids = pred.label_ids
 
-    # Replace the loss-ignored value with the padding token for this model
-    # which would be decoded to an empty string
-    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id  # else decodes as garbage
 
     pred_str = processor.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = processor.batch_decode(label_ids, skip_special_tokens=True)
@@ -170,7 +163,6 @@ def prepare_model_for_qlora(model):
         lora_alpha=1,
         use_rslora=True,
         target_modules=["q_proj", "k_proj", "v_proj", "fc1", "fc2", "out_proj"],
-        # modules_to_save=["embed_tokens"],
         lora_dropout=0.05,
         bias="none",
     )
@@ -181,143 +173,155 @@ def prepare_model_for_qlora(model):
     return model
 
 
-def compute_loss_func(
-    outputs: Seq2SeqLMOutput,
-    labels: torch.Tensor,
-    num_items_in_batch: int,
-):
-    # Until the Whisper model loss is updated to use the new Transfomers loss infrastruture,
-    # it suffers from  bug in how grad acc steps loss is calculated. This is a workaround.
-    # See https://huggingface.co/blog/gradient_accumulation
+class WhisperDistillationTrainer(Seq2SeqTrainer):
+    """Seq2SeqTrainer with label smoothing and an optional frozen-teacher KL penalty
+    (a trust region when the teacher is the checkpoint being fine-tuned). Both are
+    training-only; eval loss stays plain cross entropy so runs stay comparable."""
 
-    lm_logits = outputs.logits
-    vocab_size = lm_logits.shape[2]
-    reduction = "sum" if num_items_in_batch is not None else "mean"
-    loss_fct = torch.nn.CrossEntropyLoss(reduction=reduction)
-    # move labels to correct device to enable PP
-    labels = labels.to(lm_logits.device)
+    def __init__(
+        self,
+        *args,
+        teacher_model=None,
+        kd_weight: float = 0.0,
+        kd_temperature: float = 1.0,
+        label_smoothing: float = 0.0,
+        eval_data_collator=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        # Optional clean collator for eval, so on-the-fly augmentation doesn't make eval noisy.
+        self.eval_data_collator = eval_data_collator
+        self.teacher_model = teacher_model
+        self.kd_weight = kd_weight
+        self.kd_temperature = kd_temperature
+        self.label_smoothing = label_smoothing
+        # Suppresses Transformers' second division by grad_accum_steps - compute_loss
+        # already normalizes by num_items_in_batch (the whole accumulation window).
+        self.model_accepts_loss_kwargs = True
 
-    loss = loss_fct(lm_logits.view(-1, vocab_size), labels.reshape(-1))
-    if reduction == "sum":
-        loss = loss / num_items_in_batch
+        self._ce_total = 0.0
+        self._kd_kl_total = 0.0
+        self._loss_steps = 0
 
-    return loss
+        self.teacher_dtype = None
+        if self.teacher_model is not None:
+            self.teacher_model.to(self.args.device)
+            self.teacher_model.eval()
+            self.teacher_model.requires_grad_(False)
+            self.teacher_dtype = next(self.teacher_model.parameters()).dtype
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        """Swaps in eval_data_collator for construction only - DataLoader captures
+        collate_fn once, so self.data_collator can be restored right after."""
+        if self.eval_data_collator is None:
+            return super().get_eval_dataloader(eval_dataset)
+
+        original_collator = self.data_collator
+        self.data_collator = self.eval_data_collator
+        try:
+            return super().get_eval_dataloader(eval_dataset)
+        finally:
+            self.data_collator = original_collator
+
+    def _transcription_loss(self, logits, labels, num_items_in_batch, label_smoothing):
+        # Workaround for a grad-accumulation loss bug; see https://huggingface.co/blog/gradient_accumulation
+        vocab_size = logits.shape[2]
+        reduction = "sum" if num_items_in_batch is not None else "mean"
+        loss_fct = torch.nn.CrossEntropyLoss(reduction=reduction, label_smoothing=label_smoothing)
+        labels = labels.to(logits.device)
+
+        loss = loss_fct(logits.view(-1, vocab_size), labels.reshape(-1))
+        if reduction == "sum":
+            loss = loss / num_items_in_batch
+
+        return loss
+
+    def _teacher_kl(self, student_logits, teacher_logits, labels):
+        """Mean per-token KL(teacher || student), masked to the tokens that carry loss."""
+        scored = labels.to(student_logits.device) != -100
+        temperature = self.kd_temperature
+
+        student_log_probs = torch.nn.functional.log_softmax(
+            student_logits[scored].float() / temperature, dim=-1
+        )
+        teacher_log_probs = torch.nn.functional.log_softmax(
+            teacher_logits[scored].float() / temperature, dim=-1
+        )
+        kl = torch.nn.functional.kl_div(
+            student_log_probs, teacher_log_probs, log_target=True, reduction="batchmean"
+        )
+        return (temperature**2) * kl  # Hinton's T^2, keeps gradient scale comparable across T
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        try:
+            outputs = model(**inputs)
+            loss = self._transcription_loss(
+                outputs.logits,
+                labels,
+                num_items_in_batch,
+                label_smoothing=self.label_smoothing if model.training else 0.0,
+            )
+            if model.training:
+                self._ce_total += loss.item()
+                self._loss_steps += 1
+
+            if self.teacher_model is not None and self.kd_weight > 0 and model.training:
+                # Match teacher dtype explicitly rather than rely on ambient autocast.
+                teacher_inputs = {
+                    name: value.to(self.teacher_dtype) if torch.is_floating_point(value) else value
+                    for name, value in inputs.items()
+                }
+                with torch.no_grad():
+                    teacher_logits = self.teacher_model(**teacher_inputs).logits
+                kl = self._teacher_kl(outputs.logits, teacher_logits, labels)
+                self._kd_kl_total += kl.item()
+                loss = loss + self.kd_weight * kl
+        finally:
+            inputs["labels"] = labels
+
+        return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs, start_time=None):
+        # Logs ce/kd_kl separately (a rising train/loss alone can't say which grew), scaled
+        # to per-optimizer-step so it's comparable across different grad_accum settings.
+        if self._loss_steps:
+            optimizer_steps = self._loss_steps / self.args.gradient_accumulation_steps
+            cross_entropy = self._ce_total / optimizer_steps
+            logs["ce"] = cross_entropy
+            if self.teacher_model is not None and self.kd_weight > 0:
+                kl = self._kd_kl_total / self._loss_steps
+                logs["kd_kl"] = kl
+                logs["kd_share"] = (self.kd_weight * kl) / max(
+                    cross_entropy + self.kd_weight * kl, 1e-12
+                )
+            self._ce_total = 0.0
+            self._kd_kl_total = 0.0
+            self._loss_steps = 0
+        super().log(logs, start_time)
 
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Train a Whisper model with custom datasets.")
-    parser.add_argument(
-        "--train_datasets",
-        nargs="*",
-        help="Dataset(s) to train on. Format: dataset_name[:split_name]",
-    )
-    parser.add_argument(
-        "--target_language", type=str, default="hebrew", help="The target training language (Only a single language training is currently supported)"
-    )
-    parser.add_argument("--save_processed", help="Dataset name to save processed data (will save both train and eval)")
-    parser.add_argument(
-        "--include_timestamps_prob",
-        type=float,
-        default=0.5,
-        help="Probability to include timestamps with a sample (This might be a synthetic augmentation or an existing transcription timestamps)",
-    )
-    parser.add_argument(
-        "--include_prev_text_prob",
-        type=float,
-        default=0.5,
-        help="Probability to include previous text with a sample only when prev transcript is present on the sample",
-    )
-    parser.add_argument(
-        "--inject_synthetic_timestamps",
-        help="If timestamps are to be included with a sample but not provided, a start+end timestamp token will be injected",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--audio_shift_augmentation",
-        help="When timestamps are injected, also randomize shift augmentation on it",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--use_preprocessed",
-        nargs="+",
-        help="Dataset name to load preprocessed data from (either local path or remote dataset)",
-    )
-    parser.add_argument(
-        "--use_preprocessed_probs", nargs="+", type=float, help="Probability of using preprocessed data"
-    )
-    parser.add_argument(
-        "--ds_processor_proc_num", type=int, default=1, help="Number of parallel processors for datasets preparation"
-    )
-    parser.add_argument("--model_name", default="openai/whisper-large-v2", help="Name of the model to train")
-    parser.add_argument("--output_model_name", required=True, help="Name of the fine-tuned model to generate")
-    parser.add_argument("--hf_org_name", default="ivrit-ai", help="Name of HF Org to push the model to")
-    parser.add_argument("--skip_push_to_hub", action="store_true", help="Don't push result model to hub")
-    parser.add_argument(
-        "--eval_datasets",
-        nargs="*",
-        help="Reference dataset(s) for evaluation. Format: dataset_name[:split_name]",
-    )
-    parser.add_argument(
-        "--save_only_model", action="store_true", default=False, help="Save only the model without optimizer state"
-    )
-    parser.add_argument(
-        "--max_checkpoints_to_keep",
-        type=int,
-        default=None,
-        help="Maximum number of checkpoints to keep during training",
-    )
-    parser.add_argument(
-        "--resume_from_checkpoint", action="store_true", help="Try and resuming for last saved checkpoint"
-    )
-    parser.add_argument(
-        "--resume_from_checkpoint_path", type=str, help="Path to checkpoint to resume from", default=None
-    )
-    parser.add_argument("--save_steps", type=int, default=500, help="Number of steps between each model save/upload.")
-    parser.add_argument(
-        "--ignore_data_skip", action="store_true", help="Ignore data skip when resuming from checkpoint"
-    )
-    parser.add_argument(
-        "--mixed_precision",
-        choices=["bf16", "fp16", "tf32", None],
-        default=None,
-        help="Mixed precision mode for training",
-    )
-    parser.add_argument(
-        "--attn_implementation",
-        default=None,
-        choices=["sdpa"],
-        help="Attention implementation to use (only 'sdpa' available)",
-    )
-    parser.add_argument("--use_qlora", action="store_true", help="Use QLoRA for training")
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Warmup ratio")
-    parser.add_argument("--num_train_epochs", type=int, default=10, help="Number of training epochs")
-    parser.add_argument(
-        "--max_steps", type=int, default=-1, help="How many steps to train for - overrides num_train_epochs"
-    )
-    parser.add_argument("--warmup_steps", type=int, default=500, help="Number of warmup steps")
-    parser.add_argument(
-        "--lr_scheduler_type", type=str, default="constant_with_warmup", help="Learning rate scheduler type"
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps", type=int, default=2, help="Number of gradient accumulation steps"
-    )
-    parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay")
-    parser.add_argument(
-        "--eval_steps", type=int, help="Number of steps between two evals, if not specified defaults to logging_steps."
-    )
-    parser.add_argument(
-        "--predict_wer", action="store_true", help="Use WER as the metric for best model instead of loss"
-    )
-    parser.add_argument("--max_eval_set_size", type=int, help="Maximum number of entries to fetch from eval dataset.")
+def _init_run_tracking(args, noise_kwargs: dict) -> None:
+    """Pre-inits wandb with the full config (incl. resolved noise YAML) before the Trainer
+    exists, so its own WandbCallback layers TrainingArguments onto it instead of replacing it."""
+    if args.no_report:
+        return
 
-    parser.add_argument("--per_device_train_batch_size", type=int, default=16, help="Per-device train batch size.")
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=16, help="Per-device eval batch size.")
+    try:
+        import wandb
+    except ImportError:
+        print("wandb not installed - skipping config pre-logging (pass --no_report to silence this).")
+        return
 
-    parser.add_argument("--run_name", help="Run name to report to the run tracker")
-    parser.add_argument("--logging_steps", type=int, default=500, help="Number of step between each log")
+    config = {**vars(args), "noise": noise_kwargs}  # noise_kwargs nested: not on the command line at all
 
-    return parser.parse_args()
+    wandb.init(
+        project=os.getenv("WANDB_PROJECT", "huggingface"),
+        name=args.run_name,
+        config=config,
+    )
+    if args.noise_config:
+        wandb.save(args.noise_config, policy="now")  # exact YAML, recoverable byte-for-byte
 
 
 def main():
@@ -330,6 +334,9 @@ def main():
         raise ValueError("Cannot use preprocessed data and save preprocessed data at the same time.")
 
     processor = WhisperProcessor.from_pretrained(args.model_name, language=args.target_language, task="transcribe")
+
+    noise_kwargs = _resolve_noise_kwargs(args)
+
     preparator = DatasetPreparator(
         processor,
         proc_num=args.ds_processor_proc_num,
@@ -337,6 +344,10 @@ def main():
         condition_on_prev_sample_prob=args.include_prev_text_prob,
         inject_synthetic_timestamps=args.inject_synthetic_timestamps,
         audio_shift_augmentation=args.audio_shift_augmentation,
+        resample_augmentation=args.resample_augmentation,
+        resample_target_hz=args.resample_target_hz,
+        resample_prob=args.resample_prob,
+        **noise_kwargs,
     )
 
     dataset_shuffle_seed = 745
@@ -344,16 +355,14 @@ def main():
         preprocessed_dataset_dicts = []
         for preprocessed in args.use_preprocessed:
             try:
-                # Try to load from disk first
                 dataset_dict = load_from_disk(preprocessed)
             except FileNotFoundError:
-                # If not found on disk, try to load as a remote dataset
                 dataset_dict = load_dataset(preprocessed)
             preprocessed_dataset_dicts.append(dataset_dict)
 
         if len(preprocessed_dataset_dicts) == 1:
-            train_set = dataset_dict["train"]
-            eval_set = dataset_dict["eval"]
+            train_set = preprocessed_dataset_dicts[0]["train"]
+            eval_set = preprocessed_dataset_dicts[0]["eval"]
         else:
             probs = None
             if args.use_preprocessed_probs is not None:
@@ -363,23 +372,17 @@ def main():
                 [d["train"] for d in preprocessed_dataset_dicts],
                 probabilities=probs,
                 stopping_strategy="all_exhausted",
-                # We set the seed so each distributed process will interleave in the same way
-                # otherwise - the dataloader across each process ends up with different lengths
-                # which screws up the collective synchronization
-                # See https://huggingface.co/docs/accelerate/en/concept_guides/internal_mechanism
+                # Fixed seed so every distributed rank interleaves identically.
                 seed=dataset_shuffle_seed,
             )
             eval_set = interleave_datasets(
                 [d["eval"] for d in preprocessed_dataset_dicts],
                 probabilities=probs,
                 stopping_strategy="all_exhausted",
-                # We set the seed so each distributed process will interleave in the same way
-                # See above.
                 seed=dataset_shuffle_seed,
             )
 
     elif args.save_processed:
-
         if not args.train_datasets or not args.eval_datasets:
             raise ValueError("Both --train_datasets and --eval_datasets must be provided when using --save_processed")
 
@@ -392,7 +395,7 @@ def main():
         dataset_dict = DatasetDict({"train": train_set, "eval": eval_set})
         dataset_dict.save_to_disk(args.save_processed)
         print(f"Preprocessed datasets saved to {args.save_processed}")
-        return  # Exit after saving preprocessed data
+        return
     else:
         if not args.train_datasets or not args.eval_datasets:
             raise ValueError("Both --train_datasets and --eval_datasets must be provided for training")
@@ -406,8 +409,52 @@ def main():
     if args.max_eval_set_size:
         eval_set = eval_set.shuffle(seed=dataset_shuffle_seed).select(range(args.max_eval_set_size))
 
+    resuming = bool(args.resume_from_checkpoint or args.resume_from_checkpoint_path)
+    if args.output_model_name is None:
+        args.output_model_name = generate_run_name(args)
+        print(f"--output_model_name not given, auto-generated: {args.output_model_name}")
+    if resuming:
+        if local_dir_exists(args.output_model_name):
+            print(f"Resuming into existing output dir: {args.output_model_name}")
+    else:
+        deduped = dedupe_name(args.output_model_name, local_dir_exists)
+        if deduped != args.output_model_name:
+            print(f"Output dir '{args.output_model_name}' already exists, using '{deduped}' instead")
+            args.output_model_name = deduped
+    # run_name always mirrors output_model_name (--run_name is a deprecated no-op).
+    if args.run_name is not None and args.run_name != args.output_model_name:
+        print(
+            f"--run_name '{args.run_name}' is ignored (deprecated, no-op) - using "
+            f"'{args.output_model_name}' for both the output dir and the wandb run name."
+        )
+    args.run_name = args.output_model_name
+
+    _init_run_tracking(args, noise_kwargs)
+
+    decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+    train_noise_augmenter = preparator.noise_augmenter if args.use_preprocessed else None
+    # None when --train_datasets already baked it in; set for the live (--use_preprocessed) path.
+    train_resample_prob = (
+        args.resample_prob if (args.use_preprocessed and args.resample_augmentation) else None
+    )
+
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(
-        processor=processor, decoder_start_token_id=processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+        processor=processor,
+        decoder_start_token_id=decoder_start_token_id,
+        noise_augmenter=train_noise_augmenter,
+        resample_prob=train_resample_prob,
+        resample_target_hz=args.resample_target_hz,
+    )
+    # Eval always gets the clean collator, so WER/loss stay comparable across evals.
+    eval_data_collator = (
+        DataCollatorSpeechSeq2SeqWithPadding(
+            processor=processor,
+            decoder_start_token_id=decoder_start_token_id,
+            noise_augmenter=None,
+            resample_prob=None,
+        )
+        if (train_noise_augmenter is not None or train_resample_prob is not None)
+        else None
     )
 
     metric = evaluate.load("wer")
@@ -435,14 +482,38 @@ def main():
 
     model.generate = partial(model.generate, language=args.target_language, task="transcribe", use_cache=True)
 
+    # Exactly one warmup form reaches Transformers, so the other can't silently win.
+    if args.warmup_steps is not None:
+        warmup_steps, warmup_ratio = args.warmup_steps, 0.0
+    else:
+        warmup_steps, warmup_ratio = 0, 0.1 if args.warmup_ratio is None else args.warmup_ratio
+    print(f"Warmup: {f'{warmup_steps} steps' if warmup_steps else f'{warmup_ratio:.1%} of training'}")
+
+    teacher_model = None
+    if args.kd_weight > 0:
+        teacher_name = args.kd_teacher_model or args.model_name
+        # Teacher dtype follows --mixed_precision (halves memory; tf32 maps to full precision).
+        teacher_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(args.mixed_precision)
+        print(
+            f"Loading frozen KD teacher: {teacher_name} "
+            f"(weight={args.kd_weight}, T={args.kd_temperature}, "
+            f"dtype={teacher_dtype or torch.get_default_dtype()})"
+        )
+        teacher_model = WhisperForConditionalGeneration.from_pretrained(
+            teacher_name, attn_implementation=args.attn_implementation, torch_dtype=teacher_dtype
+        )
+        teacher_model.config.use_cache = False
+    elif args.kd_teacher_model:
+        print("Ignoring --kd_teacher_model since --kd_weight is 0")
+
     training_args = Seq2SeqTrainingArguments(
         output_dir=args.output_model_name,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         lr_scheduler_type=args.lr_scheduler_type,
-        warmup_ratio=args.warmup_ratio,  # Overidden by warmup_steps - So cannot really use this?
-        warmup_steps=args.warmup_steps,
+        warmup_ratio=warmup_ratio,
+        warmup_steps=warmup_steps,
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_strategy="steps",
@@ -455,43 +526,46 @@ def main():
         logging_strategy="steps",
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        report_to="all" if args.run_name else "none",
+        report_to="none" if args.no_report else "all",
         load_best_model_at_end=False,
         metric_for_best_model="wer" if args.predict_wer else "loss",
         greater_is_better=False,
         push_to_hub=(not args.skip_push_to_hub),
         run_name=args.run_name,
-        hub_model_id=f"{args.hf_org_name}/{args.output_model_name}" if not args.skip_push_to_hub else None,
+        # Only the final path segment is valid in a Hub repo id (output_model_name can be a full path).
+        hub_model_id=(
+            f"{args.hf_org_name}/{Path(args.output_model_name).name}"
+            if not args.skip_push_to_hub
+            else None
+        ),
         remove_unused_columns=False,
-        # Configure mixed precision based on the argument
         bf16=True if args.mixed_precision == "bf16" else None,
         fp16=True if args.mixed_precision == "fp16" else None,
         tf32=True if args.mixed_precision == "tf32" else None,
-        # Configure prediction loss and metric based on predict_wer
         prediction_loss_only=False if args.predict_wer else True,
-        # Configure save_total_limit if max_checkpoints_to_keep is provided
         save_total_limit=args.max_checkpoints_to_keep,
-        # Configure save_only_model
         save_only_model=True if args.save_only_model else None,
-        # There is not branching in training the Whisper model
-        ddp_find_unused_parameters=False,
-        # This would take longer, but will calculate the loss
-        # with proper averaging across GPUs.
-        # this is important when the dataset samples vary
-        # wildly in the amount of tokens contributing to the loss and
-        # the distribution of those samples is very unbalanced
-        average_tokens_across_devices=True,
+        gradient_checkpointing=args.gradient_checkpointing,
+        # Whisper keeps no cache during training, so the non-reentrant implementation is safe.
+        gradient_checkpointing_kwargs={"use_reentrant": False} if args.gradient_checkpointing else None,
+        ignore_data_skip=args.ignore_data_skip,
+        ddp_find_unused_parameters=False,  # no branching in the Whisper forward pass
+        average_tokens_across_devices=True,  # correct loss averaging when token counts are unbalanced
     )
 
-    trainer = Seq2SeqTrainer(
+    trainer = WhisperDistillationTrainer(
         args=training_args,
         model=model,
         train_dataset=train_set,
         eval_dataset=eval_set,
         data_collator=data_collator,
+        eval_data_collator=eval_data_collator,
         compute_metrics=lambda pred: compute_metrics(pred, processor, metric, normalizer),
         processing_class=processor,
-        compute_loss_func=compute_loss_func,
+        teacher_model=teacher_model,
+        kd_weight=args.kd_weight,
+        kd_temperature=args.kd_temperature,
+        label_smoothing=args.label_smoothing,
     )
 
     resume_from_checkpoint = False
@@ -507,7 +581,6 @@ def main():
     print("Start training!")
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
-    # Save the model
     trainer.save_model(args.output_model_name)
 
 

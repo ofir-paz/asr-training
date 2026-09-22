@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 import torch
 from datasets import (
@@ -13,35 +15,19 @@ from scipy.stats import beta
 from torchaudio.transforms import Resample
 from transformers import BatchFeature, WhisperProcessor
 
-from preprocess.augmentation import shift_audio_forward
+from preprocess.augmentation import shift_audio_forward, resample_augment
+from preprocess.noise_augmentation import NoiseAugmenter, _rms
 
-# This is defined as part of the model config
-# and should match the loaded model.
-# For all whisper models so far this is the same value
-# Ideally we will take this from the WhisperConfig but we need to
-# Process the dataset before loading the model in some use cases.
+logger = logging.getLogger(__name__)
+
+# Same across all Whisper models; ideally read from WhisperConfig, but the dataset is
+# sometimes prepared before the model is loaded.
 whisper_max_target_positions = 448
 
 
 class DatasetPreparator:
-    """
-    This class is responsible for preparing the dataset for training.
-    It will:
-    - Resample the audio to the target sampling rate if needed
-    - Extract audio features from the audio
-    - If audio was padded, store the padding in a less wasteful format
-    - If requested, augment the audio with a random shift forward
-    - Randomly decide whether to include timestamps with a sample
-    - Randomly decide whether to include previous text with a sample
-    - If timestamps are not included, inject a start-end timestamp token pair according to duration and shift augmentation, if injection was enabled
-    - If timestamps are included, remove them in case decision was to not train on them for that sample
-    - Tokenize the prev_text and text prefixing with the proper Whisper prefix tokens
-    - Return the prepared example as a BatchFeature object dropping original dataset columns
-    - If the features "has_timestamps" and "has_prev" are not present, assume no timestamps and no previous text
-
-    Notes:
-    - This process runs nicely in parallel (use proc_num > 1) but not when the device is set to GPU
-    """
+    """Resamples/extracts/augments audio and tokenizes labels into training-ready examples.
+    proc_num > 1 parallelizes well, but only on CPU."""
 
     def __init__(
         self,
@@ -58,6 +44,26 @@ class DatasetPreparator:
         # Experimental
         inject_synthetic_timestamps=False,
         audio_shift_augmentation=False,
+        # Noise augmentation (decided per-example like the shift augmentation above)
+        noise_augmentation=False,
+        noise_dir: str = None,
+        noise_apply_prob: float = 0.6,
+        noise_snr_db_range: tuple = (4.0, 25.0),
+        noise_num_noises_range: tuple = (1, 1),
+        noise_gain_jitter_db: float = 3.0,
+        noise_time_stretch_range: tuple = (0.97, 1.03),
+        noise_pitch_shift_semitone_range: tuple = (-0.5, 0.5),
+        noise_perturb_prob: float = 0.3,
+        noise_simulate_radio_channel: bool = False,
+        noise_radio_band_hz: tuple = (50.0, 4000.0),
+        noise_filter_signal_too: bool = False,
+        noise_radio_clip_drive: float = 1.0,
+        noise_coverage_frac_range: tuple = (0.5, 0.8),
+        noise_burst_len_frac_range: tuple = (0.9, 1.0),
+        # Resample augmentation
+        resample_augmentation: bool = False,
+        resample_target_hz: int = 8000,
+        resample_prob: float = 0.6,
     ):
         if proc_num > 1:  # Parallel processing will not work in multi threaded env.
             torch.set_num_threads(1)
@@ -91,6 +97,36 @@ class DatasetPreparator:
         self.inject_synthetic_timestamps = inject_synthetic_timestamps
         self.audio_shift_augmentation = audio_shift_augmentation
         self.max_shifted_audio_ends_at = 29.6
+        
+        self.resample_augmentation = resample_augmentation
+        self.resample_target_hz = resample_target_hz
+        self.resample_prob = resample_prob
+
+        self.noise_augmentation = noise_augmentation
+        self.noise_augmenter = None
+        if self.noise_augmentation:
+            if noise_dir is None:
+                raise ValueError("noise_dir must be provided when noise_augmentation=True")
+            # Loaded once here (not per-example) - the ~70 clips are cached in memory and
+            # reused across examples/epochs. Gets pickled to worker processes as-is when
+            # proc_num > 1, so noise files are only read from disk once per worker.
+            self.noise_augmenter = NoiseAugmenter(
+                noise_dir=noise_dir,
+                target_sampling_rate=self.target_sampling_rate,
+                apply_prob=noise_apply_prob,
+                snr_db_range=noise_snr_db_range,
+                num_noises_range=noise_num_noises_range,
+                gain_jitter_db=noise_gain_jitter_db,
+                time_stretch_range=noise_time_stretch_range,
+                pitch_shift_semitone_range=noise_pitch_shift_semitone_range,
+                perturb_prob=noise_perturb_prob,
+                simulate_radio_channel=noise_simulate_radio_channel,
+                radio_band_hz=noise_radio_band_hz,
+                filter_signal_too=noise_filter_signal_too,
+                radio_clip_drive=noise_radio_clip_drive,
+                coverage_frac_range=noise_coverage_frac_range,
+                burst_len_frac_range=noise_burst_len_frac_range,
+            )
 
         # Prepare the output features - to ensure optimal storage during mapping (uses disk cache for mapped content)
         self.output_features = Features(
@@ -133,10 +169,14 @@ class DatasetPreparator:
             lambda labels: len(labels) <= whisper_max_target_positions, input_columns="labels"
         )
 
+    def _select_transcribable_entries(self, dataset):
+        """Drops blank transcripts (teaches the model to emit nothing); timestamp-only
+        transcripts are kept since silence is legitimate signal."""
+        return dataset.filter(
+            lambda transcript: bool(transcript and transcript.strip()), input_columns="transcript"
+        )
+
     def _decide_example_augmentation(self, example, ancillary_features):
-        """
-        Decide whether to augment the audio with a shift (0 if no augmentation)
-        """
         example_shift = 0
         audio = example["audio"]
         audio_duration = audio["array"].shape[0] / audio["sampling_rate"]
@@ -150,6 +190,38 @@ class DatasetPreparator:
 
         ancillary_features["audio_shift_augmentation"] = example_shift
         ancillary_features["original_audio_duration"] = audio_duration
+
+        # Decide noise augmentation params up front too (same seeded rng), so the
+        # decision stays stable/reproducible for a given seed state, independent of
+        # when/how the audio itself gets loaded and resampled.
+        if self.noise_augmenter is not None:
+            noise_decision = self.noise_augmenter.decide_augmentation(self.seed)
+            ancillary_features["noise_augmentation"] = noise_decision
+            if noise_decision is None:
+                logger.debug("Noise augmentation: SKIPPED (apply_prob roll)")
+            else:
+                noise_names = [
+                    self.noise_augmenter.library.file_paths[j].name
+                    for j in noise_decision["noise_indices"]
+                ]
+                logger.debug(
+                    "Noise augmentation DECIDED | clips: %s | SNR: %.2f dB | "
+                    "gain jitter: %s dB | stretch: %s | pitch: %s st | coverage: %s",
+                    ", ".join(noise_names),
+                    noise_decision["snr_db"],
+                    ", ".join(f"{g:+.1f}" for g in noise_decision["gain_jitters_db"]),
+                    ", ".join(f"{s:.3f}" for s in noise_decision["time_stretch_factors"]),
+                    ", ".join(f"{p:+.2f}" for p in noise_decision["pitch_shift_semitones"]),
+                    ", ".join(f"{c:.2f}" for c in noise_decision["coverage_fracs"]),
+                )
+        else:
+            ancillary_features["noise_augmentation"] = None
+
+        # Decide resample augmentation (roll once here so the decision is reproducible).
+        if self.resample_augmentation:
+            ancillary_features["resample_augmentation"] = self.seed.random() < self.resample_prob
+        else:
+            ancillary_features["resample_augmentation"] = False
 
     def _prepare_example_audio(self, example, ancillary_features, result_example: BatchFeature) -> None:
         audio = example["audio"]
@@ -168,6 +240,27 @@ class DatasetPreparator:
             resampled_audio_array = shift_audio_forward(
                 resampled_audio_array, example_audio_shift_augmentation, target_sampling_rate
             )
+
+        if ancillary_features.get("resample_augmentation"):
+            resampled_audio_array = resample_augment(
+                resampled_audio_array, target_sampling_rate, self.resample_target_hz
+            )
+
+        if self.noise_augmenter is not None:
+            noise_decision = ancillary_features.get("noise_augmentation")
+            if noise_decision is not None:
+                rms_before = _rms(resampled_audio_array)
+                resampled_audio_array = self.noise_augmenter.apply(resampled_audio_array, noise_decision)
+                rms_after = _rms(resampled_audio_array)
+                logger.debug(
+                    "Noise augmentation APPLIED | RMS before: %.5f → after: %.5f (SNR target: %.2f dB)",
+                    rms_before,
+                    rms_after,
+                    noise_decision["snr_db"],
+                )
+            else:
+                resampled_audio_array = self.noise_augmenter.apply(resampled_audio_array, noise_decision)
+                logger.debug("Noise augmentation SKIPPED for this example (decision=None)")
 
         # We want to use the device kwargs - we call the feature extractor directly
         # to avoid warning from the tokenizer (which does not know how to consume a device kwarg)
@@ -242,12 +335,17 @@ class DatasetPreparator:
         should_train_on_timestamps = bool(self.seed.binomial(1, use_timestamps_sampling_prob))
         should_condition_on_prev = has_prev and bool(self.seed.binomial(1, use_prev_sampling_prob))
 
+        # Stripping is refused for cross-over segments, so track what the tokens actually
+        # end up carrying - the prefix has to follow that rather than what we sampled,
+        # otherwise we emit <|notimestamps|> ahead of a sequence full of timestamps.
+        labels_carry_timestamps = has_timestamps
         if has_timestamps and not should_train_on_timestamps:
             possible_to_strip_timestamps = self._is_removable_timestamp_token_ids(token_ids)
             if possible_to_strip_timestamps:
                 # Remove all timestamp tokens
                 token_ids = [token_id for token_id in token_ids if token_id < self.timestamp_begin_token_id]
                 # Note - no-timestamp token id is prepended as part of the prefix later.
+                labels_carry_timestamps = False
 
         prev_ids = []
         if should_condition_on_prev and has_prev:
@@ -284,8 +382,14 @@ class DatasetPreparator:
         # Know this - prev text labels should include timestamps if the transcription labels do.
         # Since we are unable to inject timestamps into prev text, we cannot accomplish the injection
         # in those cases. Hence, the below check of "prev_ids"
-        # TODO - When this feature is used - sampling probs are skewed since we "add" timestamp attributes on the fly.
-        # this is a bug, and not compatible with the sampling ratios atm.
+        # Note - injection adds the timestamp attribute on the fly, so it fires at the
+        # relative sampling ratio rather than the raw target rate. That ratio is derived
+        # for the examples that already carry removable timestamps, so the two only agree
+        # when no example in the dataset carries any - which is exactly when injection is
+        # useful, and where it lands on the requested share. On a dataset that mixes both
+        # kinds, applying that ratio here misses the target in whichever direction the
+        # forced share pushes it. Every dataset in use is all-or-nothing on timestamps, so
+        # this has no effect today; revisit if a genuinely mixed source is added.
         if should_train_on_timestamps and not has_timestamps and not prev_ids and self.inject_synthetic_timestamps:
             # Injected timestamps may be "shift forward" augmented.
             # Audio features would have been augmented accordingly.
@@ -298,9 +402,9 @@ class DatasetPreparator:
             # wrap the text segment with the synthetic injected timestamp tokens
             # and append prefix/suffix for timestamp decoding
             token_ids = [start_at_ts_id] + token_ids + [ends_at_ts_id]
-            has_timestamps = True  # So downstream processing handles proper prefixing
+            labels_carry_timestamps = True  # So downstream processing handles proper prefixing
 
-        with_timestamps = has_timestamps and should_train_on_timestamps
+        with_timestamps = labels_carry_timestamps
         prefix_tokens = self.prefix_tokens_with_ts if with_timestamps else self.prefix_tokens_no_ts
         labels_input_ids = prev_ids + prefix_tokens + token_ids + [self.eot_token_id]
 
@@ -335,25 +439,8 @@ class DatasetPreparator:
         target_sampling_error_confidence: float = 0.95,
         max_to_sample: int = 4000,
     ):
-        """Estimate the ratio of positive samples for attributes in the dataset.
-        This function uses a beta distribution to calculate the confidence interval for the estimated ratio.
-        The function will stop sampling when either the confidence interval is within the target range or
-        the maximum number of samples has been reached.
-
-        Args:
-            dataset (Dataset): The input dataset to sample from.
-            discriminators (dict[str, callable]): A dictionary where keys are attribute names and values are functions
-                that take a sample and return True if the attribute is present, False otherwise.
-            target_sampling_error_range (float): The target range for the sampling error.
-            0.05 means 5% error. (2.5% on each side)
-            target_sampling_error_confidence (float): The target confidence level for the sampling error.
-                0.95 means 95% confidence.
-            max_to_sample (int): The maximum number of samples to draw from the dataset.
-
-        Returns:
-            estimation (dict[str, dict[float, float, int]]): A dictionary where keys are attribute names and values are dictionaries
-                containing the estimated ratio, confidence interval, and number of samples.
-        """
+        """Estimates each discriminator's positive rate, stopping early once its Beta
+        confidence interval is tight enough or max_to_sample is hit."""
         attr_states = {
             name: {
                 "total_sampled": 0,
@@ -406,9 +493,24 @@ class DatasetPreparator:
 
         return results
 
+    @staticmethod
+    def _relative_sampling_ratio(
+        target_prob: float, sampled_ratio: float, forced_ratio: float = 0.0
+    ) -> float:
+        """Converts a dataset-wide target rate into a per-eligible-example rate: examples
+        forced to carry the attribute already cover part of the target, so sampled ones only
+        make up the remainder. Falls back to target_prob when nothing is sampleable, so
+        synthesizing augmentations (e.g. inject_synthetic_timestamps) still fire at the
+        requested rate instead of on every example."""
+        if sampled_ratio <= 0:
+            return target_prob
+
+        return min(1.0, max(0.0, (target_prob - forced_ratio) / sampled_ratio))
+
     def prepare_dataset(self, dataset: Dataset):
         dataset = dataset.cast_column("audio", Audio(sampling_rate=self.target_sampling_rate))
         self._validate_dataset_features(dataset)
+        dataset = self._select_transcribable_entries(dataset)
 
         columns_to_remove = dataset.column_names
         # If a DatasetDict was passed in, it contains multiple splits.
@@ -424,7 +526,7 @@ class DatasetPreparator:
         if self.timestamp_sample_prob < 1.0 or self.condition_on_prev_sample_prob < 1.0:
             print(f"Estimating attribute frequencies for relative sub-sampling.")
 
-            def has_timestamps_discriminator(example):
+            def has_removable_timestamps_discriminator(example):
                 has_timestamps = "has_timestamps" in example and example["has_timestamps"]
                 if has_timestamps:
                     token_ids = self._token_ids_from_example(example)
@@ -432,28 +534,46 @@ class DatasetPreparator:
                 else:
                     return False
 
+            def has_forced_timestamps_discriminator(example):
+                has_timestamps = "has_timestamps" in example and example["has_timestamps"]
+                return has_timestamps and not has_removable_timestamps_discriminator(example)
+
             # Estimate the ratios of the attributes in the dataset
             estimations = self.estimate_attribute_ratios(
                 dataset,
                 {
-                    "has_removable_timestamps": has_timestamps_discriminator,
+                    "has_removable_timestamps": has_removable_timestamps_discriminator,
+                    "has_forced_timestamps": has_forced_timestamps_discriminator,
                     "has_prev": lambda example: "has_prev" in example and example["has_prev"],
                 },
                 target_sampling_error_range=0.05,
                 target_sampling_error_confidence=0.95,
                 max_to_sample=4000,
             )
+            estimated_ratios = {attr: est["estimated_ratio"] for attr, est in estimations.items()}
 
+            # Cross-over segments always keep their timestamps, so they put a floor under the
+            # achievable share and only the removable ones are left to sample against it.
+            # A previous transcript is never forced onto an example, so it has no such floor.
+            timestamp_floor = estimated_ratios["has_forced_timestamps"]
             relative_sampling_ratios = {
-                attr: (
-                    min(1.0, self.timestamp_sample_prob / attr_estimation["estimated_ratio"])
-                    if attr_estimation["estimated_ratio"] > 0
-                    else 1.0
-                )
-                for attr, attr_estimation in estimations.items()
+                "has_removable_timestamps": self._relative_sampling_ratio(
+                    self.timestamp_sample_prob,
+                    estimated_ratios["has_removable_timestamps"],
+                    forced_ratio=timestamp_floor,
+                ),
+                "has_prev": self._relative_sampling_ratio(
+                    self.condition_on_prev_sample_prob, estimated_ratios["has_prev"]
+                ),
             }
 
-            estimated_ratios = {attr: est["estimated_ratio"] for attr, est in estimations.items()}
+            if self.timestamp_sample_prob < timestamp_floor:
+                print(
+                    f"Requested timestamp share {self.timestamp_sample_prob:.2f} is below the "
+                    f"{timestamp_floor:.2f} of examples whose timestamps cannot be stripped - "
+                    "preparing at that floor instead."
+                )
+
             print(f"Estimated attribute frequencies: {estimated_ratios}")
             print(f"Relative sampling ratios: {relative_sampling_ratios}")
 

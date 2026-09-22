@@ -1,0 +1,18 @@
+# Install deps (if not already in venv)
+# pip install torch torchaudio librosa scipy numpy
+
+# ── Option 1: raw speech wav files ──────────────────────────────────────────
+# python test.py  --noise-dir /Users/Roi/Desktop/asr-training/audio-set/noise_input_16khz \
+#                 --speech-dir /path/to/wav/folder \
+#                 --out-dir ./noise_test_output  --n 30
+
+# ── Option 2: pre-processed Whisper Arrow dataset (auto-detected) ────────────
+# The script detects 'input_features' instead of an 'audio' column and
+# inverts the log-mel spectrogram → waveform via Griffin-Lim automatically.
+python test.py  --noise-dir /Users/Roi/Desktop/asr-training/audio-set/noise_input_16khz \
+                --speech-dataset /Users/Shared/asr/processed/crowd-recital/train/ \
+                --out-dir ./noise_test_output  --n 30
+
+# ── Quick sanity check (5 examples, no speech source needed) ─────────────────
+# python test.py  --noise-dir /Users/Roi/Desktop/asr-training/audio-set/noise_input_16khz \
+#                 --out-dir ./noise_test_output  --n 5
