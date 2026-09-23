@@ -1,25 +1,11 @@
-# Python
+.venv*
+.cache
+audio-set/*
+!audio-set/train_augs/
+.DS_Store
+preprocess/noise_test_output
 __pycache__
-
-# Visual Studio Code
-.vscode
-
-# Ignore python virtual env folders
-.venv
-env
-venv
-
-# Data Folders
-data
-downloads
-local_models
-local_datasets
-
-# Temporary Scrips
-tmp_*.py
-
-# Local Configuration files
-config/
-
-# Local Tracker outputs
 wandb
+.gitignore
+.vscode
+results
