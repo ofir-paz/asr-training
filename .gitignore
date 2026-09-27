@@ -2,9 +2,11 @@
 .cache
 audio-set/*
 !audio-set/train_augs/
+!audio-set/test_augs/
 .DS_Store
 preprocess/noise_test_output
 __pycache__
 wandb
 .gitignore
 .vscode
+results
