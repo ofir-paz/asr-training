@@ -7,3 +7,8 @@ __pycache__
 wandb
 .gitignore
 .vscode
+
+.venv*
+.cache
+setup_scripts/
+results/
