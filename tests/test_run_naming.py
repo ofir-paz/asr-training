@@ -1,6 +1,6 @@
 from argparse import Namespace
 
-from run_naming import dedupe_name, generate_run_name
+from training.run_naming import dedupe_name, generate_run_name
 
 
 def _args(**overrides):

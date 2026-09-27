@@ -20,33 +20,14 @@ from preprocess.noise_augmentation import NoiseAugmenter, _rms
 
 logger = logging.getLogger(__name__)
 
-# This is defined as part of the model config
-# and should match the loaded model.
-# For all whisper models so far this is the same value
-# Ideally we will take this from the WhisperConfig but we need to
-# Process the dataset before loading the model in some use cases.
+# Same across all Whisper models; ideally read from WhisperConfig, but the dataset is
+# sometimes prepared before the model is loaded.
 whisper_max_target_positions = 448
 
 
 class DatasetPreparator:
-    """
-    This class is responsible for preparing the dataset for training.
-    It will:
-    - Resample the audio to the target sampling rate if needed
-    - Extract audio features from the audio
-    - If audio was padded, store the padding in a less wasteful format
-    - If requested, augment the audio with a random shift forward
-    - Randomly decide whether to include timestamps with a sample
-    - Randomly decide whether to include previous text with a sample
-    - If timestamps are not included, inject a start-end timestamp token pair according to duration and shift augmentation, if injection was enabled
-    - If timestamps are included, remove them in case decision was to not train on them for that sample
-    - Tokenize the prev_text and text prefixing with the proper Whisper prefix tokens
-    - Return the prepared example as a BatchFeature object dropping original dataset columns
-    - If the features "has_timestamps" and "has_prev" are not present, assume no timestamps and no previous text
-
-    Notes:
-    - This process runs nicely in parallel (use proc_num > 1) but not when the device is set to GPU
-    """
+    """Resamples/extracts/augments audio and tokenizes labels into training-ready examples.
+    proc_num > 1 parallelizes well, but only on CPU."""
 
     def __init__(
         self,
@@ -189,23 +170,13 @@ class DatasetPreparator:
         )
 
     def _select_transcribable_entries(self, dataset):
-        """Drop examples whose transcript is blank.
-
-        Those tokenize down to a bare prefix + end-of-transcript sequence, which teaches
-        the model to emit nothing for audible speech. Dropping them before the feature
-        extraction map also avoids preparing audio we would never train on - scoping the
-        filter to the transcript column keeps the audio undecoded, so this is nearly free.
-        A transcript holding only timestamp tokens is kept: a silent segment is
-        legitimate training signal.
-        """
+        """Drops blank transcripts (teaches the model to emit nothing); timestamp-only
+        transcripts are kept since silence is legitimate signal."""
         return dataset.filter(
             lambda transcript: bool(transcript and transcript.strip()), input_columns="transcript"
         )
 
     def _decide_example_augmentation(self, example, ancillary_features):
-        """
-        Decide whether to augment the audio with a shift (0 if no augmentation)
-        """
         example_shift = 0
         audio = example["audio"]
         audio_duration = audio["array"].shape[0] / audio["sampling_rate"]
@@ -468,25 +439,8 @@ class DatasetPreparator:
         target_sampling_error_confidence: float = 0.95,
         max_to_sample: int = 4000,
     ):
-        """Estimate the ratio of positive samples for attributes in the dataset.
-        This function uses a beta distribution to calculate the confidence interval for the estimated ratio.
-        The function will stop sampling when either the confidence interval is within the target range or
-        the maximum number of samples has been reached.
-
-        Args:
-            dataset (Dataset): The input dataset to sample from.
-            discriminators (dict[str, callable]): A dictionary where keys are attribute names and values are functions
-                that take a sample and return True if the attribute is present, False otherwise.
-            target_sampling_error_range (float): The target range for the sampling error.
-            0.05 means 5% error. (2.5% on each side)
-            target_sampling_error_confidence (float): The target confidence level for the sampling error.
-                0.95 means 95% confidence.
-            max_to_sample (int): The maximum number of samples to draw from the dataset.
-
-        Returns:
-            estimation (dict[str, dict[float, float, int]]): A dictionary where keys are attribute names and values are dictionaries
-                containing the estimated ratio, confidence interval, and number of samples.
-        """
+        """Estimates each discriminator's positive rate, stopping early once its Beta
+        confidence interval is tight enough or max_to_sample is hit."""
         attr_states = {
             name: {
                 "total_sampled": 0,
@@ -543,20 +497,11 @@ class DatasetPreparator:
     def _relative_sampling_ratio(
         target_prob: float, sampled_ratio: float, forced_ratio: float = 0.0
     ) -> float:
-        """Convert a target rate over the whole dataset into a per-example sampling rate.
-
-        An attribute is only sampled on the examples where the choice actually exists.
-        Examples carrying it unconditionally (`forced_ratio`) already cover part of the
-        target, so the sampled ones only have to make up the remainder -
-        `(target_prob - forced_ratio) / sampled_ratio`, clamped to a probability.
-
-        A target below `forced_ratio` is unreachable: the ratio clamps to zero and the
-        attribute lands on the forced share. When nothing is sampleable at all, the ratio
-        is meaningless for the strip/keep decision, so we fall back to the target itself -
-        that keeps augmentations which synthesize the attribute (see
-        `inject_synthetic_timestamps`) firing at the requested rate rather than on every
-        example.
-        """
+        """Converts a dataset-wide target rate into a per-eligible-example rate: examples
+        forced to carry the attribute already cover part of the target, so sampled ones only
+        make up the remainder. Falls back to target_prob when nothing is sampleable, so
+        synthesizing augmentations (e.g. inject_synthetic_timestamps) still fire at the
+        requested rate instead of on every example."""
         if sampled_ratio <= 0:
             return target_prob
 
