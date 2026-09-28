@@ -34,3 +34,5 @@ audio-set/*
 preprocess/noise_test_output
 setup_scripts/
 results/
+.venv*/
+.cache/
