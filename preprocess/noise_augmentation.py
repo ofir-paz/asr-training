@@ -139,17 +139,11 @@ def build_noise_waveform(
         clip = library.clips[idx]
         local_rng = np.random.default_rng(offset_seed)
 
-        if stretch != 1.0 or pitch != 0.0:
-            clip_for_bursts = clip
-            if stretch != 1.0:
-                clip_for_bursts = librosa.effects.time_stretch(clip_for_bursts, rate=stretch)
-            if pitch != 0.0:
-                clip_for_bursts = librosa.effects.pitch_shift(
-                    clip_for_bursts, sr=target_sampling_rate, n_steps=pitch
-                )
-            clip_for_bursts = clip_for_bursts.astype(np.float32)
-        else:
-            clip_for_bursts = clip
+        clip_for_bursts = clip
+        if stretch != 1.0:
+            clip_for_bursts = librosa.effects.time_stretch(clip_for_bursts, rate=stretch)
+        if pitch != 0.0:
+            clip_for_bursts = librosa.effects.pitch_shift(clip_for_bursts, sr=target_sampling_rate, n_steps=pitch)
 
         segment = _place_bursts(clip_for_bursts, length, coverage_frac, burst_len_frac_range, local_rng)
         segment = segment * (10 ** (gain_db / 20))
