@@ -10,18 +10,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import librosa
 import numpy as np
 import torch
 import torchaudio
 from numpy.typing import NDArray
 from scipy.signal import butter, sosfiltfilt
-
-try:
-    import librosa
-
-    _HAS_LIBROSA = True
-except ImportError:  # pitch/time-stretch perturbation becomes a no-op without it
-    _HAS_LIBROSA = False
 
 _AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".ogg", ".m4a")
 
@@ -145,7 +139,7 @@ def build_noise_waveform(
         clip = library.clips[idx]
         local_rng = np.random.default_rng(offset_seed)
 
-        if _HAS_LIBROSA and (stretch != 1.0 or pitch != 0.0):
+        if stretch != 1.0 or pitch != 0.0:
             clip_for_bursts = clip
             if stretch != 1.0:
                 clip_for_bursts = librosa.effects.time_stretch(clip_for_bursts, rate=stretch)
@@ -221,11 +215,6 @@ class NoiseAugmenter:
 
     def __post_init__(self):
         self.library = NoiseLibrary(self.noise_dir, self.target_sampling_rate)
-        if (self.time_stretch_range is not None or self.pitch_shift_semitone_range is not None) and not _HAS_LIBROSA:
-            warnings.warn(
-                "librosa not installed; time_stretch_range/pitch_shift_semitone_range will be ignored. "
-                "`pip install librosa` to enable light noise-clip perturbation."
-            )
 
     # ---- decide step -----------------------------------------------------
     def decide_augmentation(self, rng: np.random.Generator) -> Optional[dict]:
