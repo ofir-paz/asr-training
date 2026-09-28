@@ -33,6 +33,7 @@ from transformers import (
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 
 from training.dataloader import DataCollatorSpeechSeq2SeqWithPadding
+from training.mel_augmentations import MelNoiseAugmentation, MelResampleAugmentation
 from training.parser import _resolve_noise_kwargs, parse_arguments
 from preprocess.preperator import (
     DatasetPreparator,
@@ -432,28 +433,32 @@ def main():
     _init_run_tracking(args, noise_kwargs)
 
     decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
-    train_noise_augmenter = preparator.noise_augmenter if args.use_preprocessed else None
-    # None when --train_datasets already baked it in; set for the live (--use_preprocessed) path.
-    train_resample_prob = (
-        args.resample_prob if (args.use_preprocessed and args.resample_augmentation) else None
-    )
+    # Live augmentation only for --use_preprocessed; --train_datasets already baked it in.
+    # Order mirrors DatasetPreparator's baked path: bandwidth-limit, then add noise.
+    train_augmentations = []
+    if args.use_preprocessed:
+        if args.resample_augmentation:
+            train_augmentations.append(
+                MelResampleAugmentation(
+                    sample_rate=processor.feature_extractor.sampling_rate,
+                    prob=args.resample_prob,
+                    target_hz=args.resample_target_hz,
+                )
+            )
+        if preparator.noise_augmenter is not None:
+            train_augmentations.append(
+                MelNoiseAugmentation(preparator.noise_augmenter, processor.feature_extractor)
+            )
 
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(
         processor=processor,
         decoder_start_token_id=decoder_start_token_id,
-        noise_augmenter=train_noise_augmenter,
-        resample_prob=train_resample_prob,
-        resample_target_hz=args.resample_target_hz,
+        augmentations=train_augmentations,
     )
     # Eval always gets the clean collator, so WER/loss stay comparable across evals.
     eval_data_collator = (
-        DataCollatorSpeechSeq2SeqWithPadding(
-            processor=processor,
-            decoder_start_token_id=decoder_start_token_id,
-            noise_augmenter=None,
-            resample_prob=None,
-        )
-        if (train_noise_augmenter is not None or train_resample_prob is not None)
+        DataCollatorSpeechSeq2SeqWithPadding(processor=processor, decoder_start_token_id=decoder_start_token_id)
+        if train_augmentations
         else None
     )
 
