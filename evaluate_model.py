@@ -14,6 +14,8 @@ import whisper.normalizers
 from hebrew import Hebrew
 from tqdm import tqdm
 
+from augmentation import SAMPLE_INDEX_KEY, AugmentationPipeline, parse_augment_config
+
 
 def clean_some_unicode_from_text(text):
     chars_to_remove = "\u061C"  # Arabic letter mark
@@ -47,6 +49,12 @@ def process_entry(args):
 
     if not isinstance(entries, list):
         entries = [entries]
+
+    # Attach the dataset index so engines can key per-sample randomness on it
+    entries = [
+        {**entry, SAMPLE_INDEX_KEY: batch_start_i + j} if isinstance(entry, dict) else entry
+        for j, entry in enumerate(entries)
+    ]
 
     results = transcribe_fn(entries)
     if not isinstance(results, list):
@@ -100,7 +108,7 @@ def process_entry(args):
             entry_data["transcription_times"] = transcription_times_json
 
         for key in entry.keys():
-            if key not in ["audio", text_column]:
+            if key not in ["audio", text_column, SAMPLE_INDEX_KEY]:
                 entry_data[f"metadata_{key}"] = entry[key]
 
         entry_data_list.append(entry_data)
@@ -183,6 +191,12 @@ def calculate_transcription_time_stats(df: pandas.DataFrame):
         "raw_time": raw_time_stats
     }
 
+def check_engine_supports_kwargs(engine, engine_kwargs: dict):
+    """Fail fast instead of silently evaluating without augmentation."""
+    if engine_kwargs.get("augment") and not getattr(engine, "SUPPORTS_AUGMENTATION", False):
+        raise ValueError(f"Engine {engine.__file__!r} does not support --augment")
+
+
 def _mp_worker(
     rank: int,
     device: str,
@@ -209,6 +223,7 @@ def _mp_worker(
         spec = importlib.util.spec_from_file_location("engine", engine_path)
         engine = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(engine)
+        check_engine_supports_kwargs(engine, engine_kwargs)
 
         # Override device with the one assigned to this worker
         engine_kwargs = dict(engine_kwargs)
@@ -448,14 +463,28 @@ if __name__ == "__main__":
                         help="Comma-separated device list for process mode (e.g. 'cuda:0,cuda:1'). "
                              "The number of devices sets the number of worker processes. "
                              "Ignored in thread mode (use --device instead).")
+    parser.add_argument("--augment", type=str, default=None,
+                        help="Augmentation config: JSON file path or inline JSON, "
+                             "e.g. '[{\"name\": \"gaussian_noise\", \"min_snr_db\": 10, \"max_snr_db\": 30}]'")
+    parser.add_argument("--aug-seed", type=int, default=0, help="Base seed for per-sample augmentation randomness")
 
     args = parser.parse_args()
+
+    # Validate early (before loading models/datasets) and forward the normalized config
+    aug_kwargs = {}
+    if args.augment:
+        aug_config = AugmentationPipeline.from_config(parse_augment_config(args.augment), args.aug_seed).to_config()
+        aug_kwargs = {"augment": aug_config, "aug_seed": args.aug_seed}
 
     # Parse dataset info from command line argument
     dataset_parts = args.dataset.split(":")
     dataset_name = dataset_parts[0]
     dataset_split = dataset_parts[1] if len(dataset_parts) > 1 else "test"
     ds_text_column = dataset_parts[2] if len(dataset_parts) > 2 else "text"
+
+    if aug_kwargs:
+        # Same index in different datasets must not share randomness
+        aug_kwargs["aug_dataset"] = f"{dataset_name}:{args.name or ''}:{dataset_split}"
 
     output_exists = os.path.exists(args.output)
 
@@ -472,7 +501,7 @@ if __name__ == "__main__":
         if not devices:
             parser.error("--devices must contain at least one device string")
 
-        engine_kwargs = {"model_path": args.model}
+        engine_kwargs = {"model_path": args.model, **aug_kwargs}
         # Note: 'device' is overridden per worker; we still forward any
         # extra engine kwargs via the dict if needed in the future.
 
@@ -506,6 +535,9 @@ if __name__ == "__main__":
         results_df["dataset"] = dataset_name
         results_df["dataset_split"] = dataset_split
         results_df["engine"] = args.engine
+        if aug_kwargs:
+            results_df["augment"] = json.dumps(aug_kwargs["augment"])
+            results_df["aug_seed"] = args.aug_seed
 
         results_df.to_csv(args.output, encoding="utf-8", index=False)
         print(f"Results saved to {args.output}")
@@ -514,9 +546,10 @@ if __name__ == "__main__":
         spec = importlib.util.spec_from_file_location("engine", args.engine)
         engine = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(engine)
+        check_engine_supports_kwargs(engine, aug_kwargs)
 
         print(f"Loading engine {args.engine} with model {args.model}...")
-        transcribe_fn = engine.create_app(model_path=args.model, device=args.device)
+        transcribe_fn = engine.create_app(model_path=args.model, device=args.device, **aug_kwargs)
 
         print(f"Loading dataset {args.dataset}...")
         if args.name:
@@ -532,6 +565,9 @@ if __name__ == "__main__":
         results_df["dataset"] = dataset_name
         results_df["dataset_split"] = dataset_split
         results_df["engine"] = args.engine
+        if aug_kwargs:
+            results_df["augment"] = json.dumps(aug_kwargs["augment"])
+            results_df["aug_seed"] = args.aug_seed
 
         results_df.to_csv(args.output, encoding="utf-8", index=False)
         print(f"Results saved to {args.output}")

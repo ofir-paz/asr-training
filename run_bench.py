@@ -9,6 +9,8 @@ from pathlib import Path
 from huggingface_hub import HfApi
 from huggingface_hub.errors import RepositoryNotFoundError, GatedRepoError
 
+from augmentation import AugmentationPipeline, parse_augment_config
+
 
 def extract_hf_model_path(ds_path: str) -> str:
     return ds_path.split(":")[0]
@@ -113,7 +115,15 @@ def main():
     parser.add_argument("--batch-size", type=str, default="1", help="per transcribe call batch size")
     parser.add_argument("--benchmark-timing", type=int, default=None, metavar="N",
                         help="Run each transcription N times and store all timing results")
+    parser.add_argument("--augment", type=str, default=None,
+                        help="Augmentation config: JSON file path or inline JSON (see augmentation.py)")
+    parser.add_argument("--aug-seed", type=int, default=0, help="Base seed for per-sample augmentation randomness")
     args = parser.parse_args()
+
+    # Validate before running anything - a typo should not fail after the first dataset
+    augment_config = None
+    if args.augment:
+        augment_config = AugmentationPipeline.from_config(parse_augment_config(args.augment), args.aug_seed).to_config()
 
     # Ensure engine script exists
     engine_path = Path(args.engine)
@@ -129,6 +139,12 @@ def main():
     with open(machine_info_path, "w") as f:
         json.dump(machine_info, f, indent=2)
     print(f"Machine info saved to {machine_info_path}")
+
+    if augment_config:
+        augmentation_path = os.path.join(args.output_dir, "augmentation.json")
+        with open(augmentation_path, "w") as f:
+            json.dump({"aug_seed": args.aug_seed, "augment": augment_config}, f, indent=2)
+        print(f"Augmentation config saved to {augmentation_path}")
 
     # Define dataset configurations as list of tuples
     datasets = [
@@ -180,6 +196,8 @@ def main():
             cmd.extend(["--name", ds_name])
         if args.benchmark_timing:
             cmd.extend(["--benchmark-timing", str(args.benchmark_timing)])
+        if augment_config:
+            cmd.extend(["--augment", json.dumps(augment_config), "--aug-seed", str(args.aug_seed)])
 
         try:
             subprocess.run(cmd, check=True)
