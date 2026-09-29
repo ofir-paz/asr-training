@@ -23,5 +23,16 @@ config/
 
 # Local Tracker outputs
 wandb
+
+# Local
+.venv*
+.cache
+.DS_Store
+audio-set/*
+!audio-set/train_augs/
+!audio-set/test_augs/
+preprocess/noise_test_output
+setup_scripts/
+results/
 .venv*/
 .cache/
