@@ -2,9 +2,11 @@
 
 import argparse
 import concurrent.futures
+import dataclasses
 import importlib.util
 import json
 import os
+from functools import partial
 
 import datasets
 import jiwer
@@ -43,10 +45,13 @@ class HebrewTextNormalizer:
 
 
 def process_entry(args):
-    batch_start_i, entries, transcribe_fn, text_column, normalizer, benchmark_timing = args
+    batch_start_i, entries, transcribe_fn, text_column, normalizer, benchmark_timing, augmentation = args
 
     if not isinstance(entries, list):
         entries = [entries]
+
+    if augmentation is not None:
+        entries = [augmentation(entry) for entry in entries]
 
     results = transcribe_fn(entries)
     if not isinstance(results, list):
@@ -195,6 +200,7 @@ def _mp_worker(
     text_column: str,
     benchmark_timing,
     batch_size: int,
+    augmentation,
     result_queue,
 ):
     """Worker process: loads the engine and model on the assigned device, processes its dataset shard.
@@ -229,13 +235,13 @@ def _mp_worker(
         if batch_size == 1:
             for idx in shard_indices:
                 entry = ds[idx]
-                batch_results = process_entry((idx, entry, transcribe_fn, text_column, normalizer, benchmark_timing))
+                batch_results = process_entry((idx, entry, transcribe_fn, text_column, normalizer, benchmark_timing, augmentation))
                 result_queue.put(batch_results)
         else:
             for i in range(0, len(shard_indices), batch_size):
                 batch_idx = shard_indices[i : i + batch_size]
                 batch = list(ds.select(batch_idx))
-                batch_results = process_entry((batch_idx[0], batch, transcribe_fn, text_column, normalizer, benchmark_timing))
+                batch_results = process_entry((batch_idx[0], batch, transcribe_fn, text_column, normalizer, benchmark_timing, augmentation))
                 result_queue.put(batch_results)
 
     except Exception as exc:
@@ -258,6 +264,7 @@ def evaluate_model_multiprocess(
     devices: list,
     benchmark_timing=None,
     batch_size: int = 1,
+    augmentation=None,
 ) -> pandas.DataFrame:
     """Evaluate a model using one worker process per device.
 
@@ -282,6 +289,8 @@ def evaluate_model_multiprocess(
         benchmark_timing: If set, each entry is transcribed this many times
             and all timing values are stored.
         batch_size: Number of entries per transcription call.
+        augmentation: Optional callable applied to each entry before it is
+            transcribed (see ``preprocess.eval_augmentation``).
 
     Returns:
         A :class:`pandas.DataFrame` with one row per dataset entry, sorted
@@ -321,6 +330,7 @@ def evaluate_model_multiprocess(
                 text_column,
                 benchmark_timing,
                 batch_size,
+                augmentation,
                 result_queue,
             ),
         )
@@ -375,19 +385,21 @@ def evaluate_model_multiprocess(
     return pandas.DataFrame(entries_data)
 
 
-def evaluate_model(transcribe_fn, ds, text_column, num_workers=1, benchmark_timing=None, batch_size=1):
+def evaluate_model(transcribe_fn, ds, text_column, num_workers=1, benchmark_timing=None, batch_size=1, augmentation=None):
     normalizer = HebrewTextNormalizer()
     entries_data = []
 
     # Prepare arguments for parallel processing
     if batch_size == 1:
-        process_args = [(i, ds[i], transcribe_fn, text_column, normalizer, benchmark_timing) for i in range(len(ds))]
+        process_args = [
+            (i, ds[i], transcribe_fn, text_column, normalizer, benchmark_timing, augmentation) for i in range(len(ds))
+        ]
     else:
         process_args = []
         for i in range(0, len(ds), batch_size):
             batch_indices = range(i, min(i + batch_size, len(ds)))
             batch = list(ds.select(batch_indices))
-            process_args.append((i, batch, transcribe_fn, text_column, normalizer, benchmark_timing))
+            process_args.append((i, batch, transcribe_fn, text_column, normalizer, benchmark_timing, augmentation))
 
     if num_workers == 1:
         # Single-threaded processing
@@ -426,6 +438,65 @@ def evaluate_model(transcribe_fn, ds, text_column, num_workers=1, benchmark_timi
 
     return pandas.DataFrame(entries_data)
 
+WHISPER_SAMPLING_RATE = 16000
+
+
+def build_eval_augmentation(args):
+    """Test-time noise augmentation from --noise-config, or None when it isn't given."""
+    dependent_flags = {
+        "--noise-dir": args.noise_dir,
+        "--noise-apply-prob": args.noise_apply_prob,
+        "--noise-band-limit-hz": args.noise_band_limit_hz,
+        "--augmentation-seed": args.augmentation_seed,
+    }
+    if args.noise_config is None:
+        passed = [flag for flag, value in dependent_flags.items() if value is not None]
+        if passed:
+            raise ValueError(f"{', '.join(passed)} only take effect with --noise-config, which is not set")
+        return None
+
+    from preprocess.augmentation import resample_augment
+    from preprocess.eval_augmentation import EvalNoiseAugmentation
+    from preprocess.noise_augmentation import NoiseAugmenter
+    from training.parser import _load_noise_config
+
+    # Same YAML schema as training's --noise_config, so a benchmark can reuse its settings.
+    # The loader prefixes every key with "noise_"; NoiseAugmenter's fields drop it, except noise_dir.
+    field_names = {field.name for field in dataclasses.fields(NoiseAugmenter)}
+    noise_kwargs = {
+        key if key in field_names else key.removeprefix("noise_"): value
+        for key, value in _load_noise_config(args.noise_config).items()
+    }
+    if args.noise_dir is not None:
+        noise_kwargs["noise_dir"] = args.noise_dir
+    if args.noise_apply_prob is not None:
+        noise_kwargs["apply_prob"] = args.noise_apply_prob
+    if args.noise_band_limit_hz is not None:
+        noise_kwargs["clip_transform"] = partial(resample_augment, target_hz=args.noise_band_limit_hz)
+
+    augmenter = NoiseAugmenter(target_sampling_rate=WHISPER_SAMPLING_RATE, **noise_kwargs)
+    print(
+        f"Test-time noise augmentation: {len(augmenter.library)} clips from {augmenter.noise_dir}, "
+        f"apply_prob={augmenter.apply_prob}, snr_db_range={augmenter.snr_db_range}, "
+        f"band_limit_hz={args.noise_band_limit_hz}, "
+        + (f"seed={args.augmentation_seed}" if args.augmentation_seed is not None else "unseeded (random)")
+    )
+    return EvalNoiseAugmentation(augmenter, seed=args.augmentation_seed)
+
+
+def augmentation_columns(args) -> dict:
+    """Run-level record of the test-time augmentation, added to every results row."""
+    if args.noise_config is None:
+        return {}
+    return {
+        "augmentation_noise_config": args.noise_config,
+        "augmentation_noise_dir": args.noise_dir,
+        "augmentation_apply_prob": args.noise_apply_prob,
+        "augmentation_band_limit_hz": args.noise_band_limit_hz,
+        "augmentation_seed": args.augmentation_seed,
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate a speech-to-text model.")
     parser.add_argument("--engine", type=str, required=True, help="Path to engine script")
@@ -449,7 +520,25 @@ if __name__ == "__main__":
                              "The number of devices sets the number of worker processes. "
                              "Ignored in thread mode (use --device instead).")
 
+    augmentation_args = parser.add_argument_group(
+        "test-time noise augmentation",
+        "Mix noise into every example before transcription. Enabled by --noise-config.",
+    )
+    augmentation_args.add_argument("--noise-config", type=str, default=None, metavar="YAML_PATH",
+                                   help="Noise settings, in the same YAML schema as train-whisper.py's --noise_config")
+    augmentation_args.add_argument("--noise-dir", type=str, default=None,
+                                   help="Override the YAML's noise_dir - point this at noise held out from training")
+    augmentation_args.add_argument("--noise-apply-prob", type=float, default=None,
+                                   help="Override the YAML's apply_prob (1.0 puts noise on every example)")
+    augmentation_args.add_argument("--noise-band-limit-hz", type=int, default=None,
+                                   help="Round-trip every noise clip through this sample rate on load, "
+                                        "e.g. 8000 to match noise recorded over a telephony/radio channel")
+    augmentation_args.add_argument("--augmentation-seed", type=int, default=None,
+                                   help="Seed each example's noise from (this seed, a hash of the example's audio), "
+                                        "so every model is scored on identical noisy audio. Omit for fresh randomness.")
+
     args = parser.parse_args()
+    augmentation = build_eval_augmentation(args)
 
     # Parse dataset info from command line argument
     dataset_parts = args.dataset.split(":")
@@ -499,6 +588,7 @@ if __name__ == "__main__":
             devices=devices,
             benchmark_timing=args.benchmark_timing,
             batch_size=args.batch_size,
+            augmentation=augmentation,
         )
 
         # Add model and dataset info as columns
@@ -506,6 +596,8 @@ if __name__ == "__main__":
         results_df["dataset"] = dataset_name
         results_df["dataset_split"] = dataset_split
         results_df["engine"] = args.engine
+        for column, value in augmentation_columns(args).items():
+            results_df[column] = value
 
         results_df.to_csv(args.output, encoding="utf-8", index=False)
         print(f"Results saved to {args.output}")
@@ -525,13 +617,17 @@ if __name__ == "__main__":
             ds = datasets.load_dataset(dataset_name, trust_remote_code=True)[dataset_split]
 
         print(f"Beginning evaluation with {args.workers} workers.")
-        results_df = evaluate_model(transcribe_fn, ds, ds_text_column, args.workers, args.benchmark_timing, args.batch_size)
+        results_df = evaluate_model(
+            transcribe_fn, ds, ds_text_column, args.workers, args.benchmark_timing, args.batch_size, augmentation
+        )
 
         # Add model and dataset info as columns
         results_df["model"] = args.model
         results_df["dataset"] = dataset_name
         results_df["dataset_split"] = dataset_split
         results_df["engine"] = args.engine
+        for column, value in augmentation_columns(args).items():
+            results_df[column] = value
 
         results_df.to_csv(args.output, encoding="utf-8", index=False)
         print(f"Results saved to {args.output}")

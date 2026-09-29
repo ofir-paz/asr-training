@@ -8,7 +8,7 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import librosa
 import numpy as np
@@ -154,27 +154,43 @@ def build_noise_waveform(
 
 class NoiseLibrary:
     """Loads/caches noise files at a target sample rate, eagerly (not lazily) so behavior is
-    predictable once pickled out to dataset.map(num_proc=...) workers."""
+    predictable once pickled out to dataset.map(num_proc=...) workers.
 
-    def __init__(self, noise_dir: str, target_sampling_rate: int, extensions: tuple[str, ...] = _AUDIO_EXTENSIONS):
+    `clip_transform(clip, sample_rate)`, if given, is applied to every clip once at load time -
+    e.g. band-limiting a raw noise corpus to match the channel the speech came through.
+    """
+
+        def __init__(
+            self,
+            noise_dir: str,
+            target_sampling_rate: int,
+            extensions: tuple[str, ...] = _AUDIO_EXTENSIONS,
+            clip_transform: Optional[Callable[[NDArray[np.float32], int], NDArray[np.float32]]] = None,
+        ):
         self.noise_dir = Path(noise_dir)
         self.target_sampling_rate = target_sampling_rate # should be 16khz
-        self.file_paths = sorted(p for p in self.noise_dir.rglob("*") if p.suffix.lower() in extensions)
+        candidate_paths = sorted(p for p in self.noise_dir.rglob("*") if p.suffix.lower() in extensions)
 
-        if not self.file_paths:
+        if not candidate_paths:
             raise ValueError(f"No noise files found under {noise_dir} (looked for {extensions})")
 
+        # file_paths[i] always names clips[i] - skipped files are left out of both, so a
+        # decision's noise_indices can be mapped back to file names.
+        self.file_paths: list[Path] = []
         self.clips: list[NDArray[np.float32]] = []
-        for path in self.file_paths:
+        for path in candidate_paths:
             waveform, sr = torchaudio.load(str(path))  # (channels, samples)
             if waveform.shape[0] > 1:
                 waveform = waveform.mean(dim=0, keepdim=True)  # downmix to mono
             if sr != target_sampling_rate:
                 waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sampling_rate)(waveform)
             clip = waveform.squeeze(0).numpy().astype(np.float32)
+            if clip_transform is not None:
+                clip = clip_transform(clip, target_sampling_rate).astype(np.float32)
             if clip.size == 0 or _rms(clip) < _SILENCE_RMS_THRESHOLD:
                 warnings.warn(f"Noise clip appears silent/empty, skipping: {path}")
                 continue
+            self.file_paths.append(path)
             self.clips.append(clip)
 
         if not self.clips:
@@ -205,10 +221,12 @@ class NoiseAugmenter:
     radio_band_hz: tuple[float, float] = (50.0, 4000.0)
     filter_signal_too: bool = False
     radio_clip_drive: float = 1.0
+    # Applied to every noise clip once at load time; see NoiseLibrary.
+    clip_transform: Optional[Callable[[NDArray[np.float32], int], NDArray[np.float32]]] = None
     library: NoiseLibrary = field(init=False, repr=False)
 
     def __post_init__(self):
-        self.library = NoiseLibrary(self.noise_dir, self.target_sampling_rate)
+        self.library = NoiseLibrary(self.noise_dir, self.target_sampling_rate, clip_transform=self.clip_transform)
 
     # ---- decide step -----------------------------------------------------
     def decide_augmentation(self, rng: np.random.Generator) -> Optional[dict]:
