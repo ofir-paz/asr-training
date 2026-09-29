@@ -17,6 +17,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
     augmentations: List[Callable[[torch.Tensor], torch.Tensor]] = field(default_factory=list)
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        # Ensure input_features are decompressed if needed:
         input_features = []
         for feature in features:
             pad_amount = feature.get("pad_amount", 0)
@@ -40,13 +41,26 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"]
 
+        # Labels, represent the input to the decoder
         batch["decoder_input_ids"] = labels[:, :-1]
 
-        # Shift left so decoder output i aligns with label i. Warning: some transformers
-        # versions assume labels are NOT pre-shifted when using the default ForCausalLMLoss.
+        # Shift all labels to the left, thus the expected generated label
+        # is at the same index of the generated output id from the decoder
+        # and the loss function would compare them (cross entropy loss in this case)
+        # Note - this means there is no loss calculated for the first "start of transcript" token id
+        # since it is not expected to be predicted but always provided.
+        # The loss is calculated for the task/lang/notimestamp tokens since the model needs to know
+        # to associate them with the proper output
+        # **Warning!** the labels are shifted here, and some version of transformers will assume
+        # they are not if using the default "ForCausalLMLoss"
+        # Once Whisper is updated to use that built-in loss - need to reconsider the collator.
+        # Atm the custom loss function expects this shift to be done here.
         labels = labels[:, 1:]
         labels_mask = labels_batch.attention_mask[:, 1:]
-        labels = labels.masked_fill(labels_mask.ne(1), -100)  # -100 = ignored by the loss
+
+        # Where we do not need to attend when calculating loss - -100 is the agreed
+        # ignored value for the pytorch loss functions
+        labels = labels.masked_fill(labels_mask.ne(1), -100)
 
         # replace initial prompt tokens with -100 to ignore correctly when computing the loss
         bos_index = torch.argmax((labels == self.decoder_start_token_id).long(), dim=1)

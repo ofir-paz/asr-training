@@ -42,7 +42,8 @@ from preprocess.preperator import (
 )
 from training.run_naming import dedupe_name, generate_run_name, local_dir_exists
 
-# Splits on ":" but not inside "[...]" - HF's split-slicing syntax.
+# Split on : but allow : inside [] for the HF split slicing syntax
+# https://huggingface.co/docs/datasets/loading#slice-splits
 dataset_spec_split_pattern = r":(?=(?:[^\[\]]|\[[^\[\]]*\])*$)"
 
 # Column names some datasets use instead of "transcript" (renaming is metadata-only).
@@ -109,14 +110,23 @@ def load_datasets(dataset_specs):
             if dataset.builder_name == "json" and not "transcript" in dataset.features:
                 print("Assumed dataset format mis-detection. Attempting to load using `load_from_disk` instead.")
                 raise ValueError("Dataset format mis-detection.")
-        except Exception:  # local dataset misdetected as remote; scoped so Ctrl-C isn't swallowed
+
+        # Local datasets, could suffer from a bug where there are more ".json" files
+        # than ".arrow" files which leads to a mis-detection of the dataset format.
+        # The "load_from_disk" API can get around this problem since it's designed to load
+        # such locally stored dataset generated using "save_to_disk"
+        except Exception:  # scoped so Ctrl-C isn't swallowed
             dataset = load_from_disk(dataset_name)
 
-            # Support load_dataset's split-slicing syntax here too.
+            # But, we want to support the flexible "split instruction" syntax like load_dataset provides.
+            # Hf made this extremely hard, by hiding the parsing and results inside a wrapped internal class.
+            # Why? why HF ?!
             read_instruction = ReadInstruction.from_spec(split)
             actual_ri_data = read_instruction._relative_instructions[0]
             slice_units = actual_ri_data.unit
-            if slice_units != 'abs':  # only "abs" units supported, not pct syntax
+            # We won't go that crazy - only support "abs" units (not pct syntax)
+            if slice_units != 'abs':
+                # This is such shame - HF please fix this.
                 raise ValueError(f'Unable to support the split definition: ${split} - please read the code for more details.')
 
             split_name = actual_ri_data.splitname
@@ -139,7 +149,9 @@ def compute_metrics(pred, processor, metric, normalizer):
     pred_ids = pred.predictions
     label_ids = pred.label_ids
 
-    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id  # else decodes as garbage
+    # Replace the loss-ignored value with the padding token for this model
+    # which would be decoded to an empty string
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
 
     pred_str = processor.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = processor.batch_decode(label_ids, skip_special_tokens=True)
@@ -164,6 +176,7 @@ def prepare_model_for_qlora(model):
         lora_alpha=1,
         use_rslora=True,
         target_modules=["q_proj", "k_proj", "v_proj", "fc1", "fc2", "out_proj"],
+        # modules_to_save=["embed_tokens"],
         lora_dropout=0.05,
         bias="none",
     )
@@ -225,10 +238,13 @@ class WhisperDistillationTrainer(Seq2SeqTrainer):
             self.data_collator = original_collator
 
     def _transcription_loss(self, logits, labels, num_items_in_batch, label_smoothing):
-        # Workaround for a grad-accumulation loss bug; see https://huggingface.co/blog/gradient_accumulation
+        # Until the Whisper model loss is updated to use the new Transfomers loss infrastruture,
+        # it suffers from  bug in how grad acc steps loss is calculated. This is a workaround.
+        # See https://huggingface.co/blog/gradient_accumulation
         vocab_size = logits.shape[2]
         reduction = "sum" if num_items_in_batch is not None else "mean"
         loss_fct = torch.nn.CrossEntropyLoss(reduction=reduction, label_smoothing=label_smoothing)
+        # move labels to correct device to enable PP
         labels = labels.to(logits.device)
 
         loss = loss_fct(logits.view(-1, vocab_size), labels.reshape(-1))
@@ -356,8 +372,10 @@ def main():
         preprocessed_dataset_dicts = []
         for preprocessed in args.use_preprocessed:
             try:
+                # Try to load from disk first
                 dataset_dict = load_from_disk(preprocessed)
             except FileNotFoundError:
+                # If not found on disk, try to load as a remote dataset
                 dataset_dict = load_dataset(preprocessed)
             preprocessed_dataset_dicts.append(dataset_dict)
 
@@ -373,13 +391,18 @@ def main():
                 [d["train"] for d in preprocessed_dataset_dicts],
                 probabilities=probs,
                 stopping_strategy="all_exhausted",
-                # Fixed seed so every distributed rank interleaves identically.
+                # We set the seed so each distributed process will interleave in the same way
+                # otherwise - the dataloader across each process ends up with different lengths
+                # which screws up the collective synchronization
+                # See https://huggingface.co/docs/accelerate/en/concept_guides/internal_mechanism
                 seed=dataset_shuffle_seed,
             )
             eval_set = interleave_datasets(
                 [d["eval"] for d in preprocessed_dataset_dicts],
                 probabilities=probs,
                 stopping_strategy="all_exhausted",
+                # We set the seed so each distributed process will interleave in the same way
+                # See above.
                 seed=dataset_shuffle_seed,
             )
 
@@ -396,7 +419,7 @@ def main():
         dataset_dict = DatasetDict({"train": train_set, "eval": eval_set})
         dataset_dict.save_to_disk(args.save_processed)
         print(f"Preprocessed datasets saved to {args.save_processed}")
-        return
+        return  # Exit after saving preprocessed data
     else:
         if not args.train_datasets or not args.eval_datasets:
             raise ValueError("Both --train_datasets and --eval_datasets must be provided for training")
@@ -544,18 +567,28 @@ def main():
             else None
         ),
         remove_unused_columns=False,
+        # Configure mixed precision based on the argument
         bf16=True if args.mixed_precision == "bf16" else None,
         fp16=True if args.mixed_precision == "fp16" else None,
         tf32=True if args.mixed_precision == "tf32" else None,
+        # Configure prediction loss and metric based on predict_wer
         prediction_loss_only=False if args.predict_wer else True,
+        # Configure save_total_limit if max_checkpoints_to_keep is provided
         save_total_limit=args.max_checkpoints_to_keep,
+        # Configure save_only_model
         save_only_model=True if args.save_only_model else None,
         gradient_checkpointing=args.gradient_checkpointing,
         # Whisper keeps no cache during training, so the non-reentrant implementation is safe.
         gradient_checkpointing_kwargs={"use_reentrant": False} if args.gradient_checkpointing else None,
         ignore_data_skip=args.ignore_data_skip,
-        ddp_find_unused_parameters=False,  # no branching in the Whisper forward pass
-        average_tokens_across_devices=True,  # correct loss averaging when token counts are unbalanced
+        # There is not branching in training the Whisper model
+        ddp_find_unused_parameters=False,
+        # This would take longer, but will calculate the loss
+        # with proper averaging across GPUs.
+        # this is important when the dataset samples vary
+        # wildly in the amount of tokens contributing to the loss and
+        # the distribution of those samples is very unbalanced
+        average_tokens_across_devices=True,
     )
 
     trainer = WhisperDistillationTrainer(
@@ -586,6 +619,7 @@ def main():
     print("Start training!")
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
+    # Save the model
     trainer.save_model(args.output_model_name)
 
 
