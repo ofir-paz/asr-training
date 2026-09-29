@@ -1,4 +1,6 @@
 import numpy as np
+import torch
+import torchaudio.functional as ta_f
 from numpy.typing import NDArray
 
 from .utils import get_crossfade_mask_pair
@@ -36,3 +38,15 @@ def shift_audio_forward(audio: NDArray[np.float32], shift_sec: float, sample_rat
     ] *= fade_in[:fade_in_length]
 
     return shifted_samples
+
+
+def resample_augment(audio: NDArray[np.float32], sample_rate: int, target_hz: int = 8000) -> NDArray[np.float32]:
+    """Simulates telephony-quality audio via a downsample/upsample round trip - the lossy
+    band-limiting an ASR model trained on clean audio may meet at inference time."""
+    if sample_rate <= target_hz:
+        return audio
+
+    t = torch.from_numpy(audio).unsqueeze(0)
+    down = ta_f.resample(t, sample_rate, target_hz)
+    up = ta_f.resample(down, target_hz, sample_rate)
+    return up.squeeze(0).numpy().astype(audio.dtype)
