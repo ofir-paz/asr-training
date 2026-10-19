@@ -160,13 +160,13 @@ class NoiseLibrary:
     e.g. band-limiting a raw noise corpus to match the channel the speech came through.
     """
 
-        def __init__(
-            self,
-            noise_dir: str,
-            target_sampling_rate: int,
-            extensions: tuple[str, ...] = _AUDIO_EXTENSIONS,
-            clip_transform: Optional[Callable[[NDArray[np.float32], int], NDArray[np.float32]]] = None,
-        ):
+    def __init__(
+        self,
+        noise_dir: str,
+        target_sampling_rate: int,
+        extensions: tuple[str, ...] = _AUDIO_EXTENSIONS,
+        clip_transform: Optional[Callable[[NDArray[np.float32], int], NDArray[np.float32]]] = None,
+    ):
         self.noise_dir = Path(noise_dir)
         self.target_sampling_rate = target_sampling_rate # should be 16khz
         candidate_paths = sorted(p for p in self.noise_dir.rglob("*") if p.suffix.lower() in extensions)
