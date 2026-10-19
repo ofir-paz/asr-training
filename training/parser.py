@@ -253,6 +253,7 @@ def parse_arguments():
         help="Override filter_signal_too.",
     )
     pg.add_argument("--noise_radio_clip_drive", type=float, default=None, help="Override radio_clip_drive.")
+    pg.add_argument("--noise_band_limit_hz", type=int, default=None, help="Override band_limit_hz.")
     pg.add_argument(
         "--noise_augmentation",
         action="store_true",
@@ -298,6 +299,7 @@ _NOISE_CONFIG_OVERRIDE_KEYS = [
     "noise_radio_band_hz",
     "noise_filter_signal_too",
     "noise_radio_clip_drive",
+    "noise_band_limit_hz",
 ]
 
 

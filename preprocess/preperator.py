@@ -1,4 +1,5 @@
 import logging
+from functools import partial
 
 import numpy as np
 import torch
@@ -60,6 +61,8 @@ class DatasetPreparator:
         noise_radio_clip_drive: float = 1.0,
         noise_coverage_frac_range: tuple = (0.5, 0.8),
         noise_burst_len_frac_range: tuple = (0.9, 1.0),
+        # Round-trip each noise clip through this rate on load (e.g. 8000 for radio/telephony noise)
+        noise_band_limit_hz: int = None,
         # Resample augmentation
         resample_augmentation: bool = False,
         resample_target_hz: int = 8000,
@@ -126,6 +129,9 @@ class DatasetPreparator:
                 radio_clip_drive=noise_radio_clip_drive,
                 coverage_frac_range=noise_coverage_frac_range,
                 burst_len_frac_range=noise_burst_len_frac_range,
+                clip_transform=(
+                    partial(resample_augment, target_hz=noise_band_limit_hz) if noise_band_limit_hz else None
+                ),
             )
 
         # Prepare the output features - to ensure optimal storage during mapping (uses disk cache for mapped content)

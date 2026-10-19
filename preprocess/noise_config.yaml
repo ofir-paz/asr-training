@@ -35,6 +35,11 @@ coverage_frac_range: [0.6, 0.8]
 # What fraction of each noise clip is used per burst (90–100% = near-full clip).
 burst_len_frac_range: [0.9, 1.0]
 
+# Round-trip every noise clip through this sample rate when it is loaded (16k -> N -> 16k),
+# removing content above N/2. 8000 matches noise recorded over an 8 kHz radio/telephony
+# channel when the clips themselves were saved at a higher rate. null = full bandwidth.
+band_limit_hz: null
+
 # ── Per-clip perturbation (requires librosa) ──────────────────────────────────
 
 # Probability that a picked clip gets time-stretch + pitch-shift applied.

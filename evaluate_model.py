@@ -442,7 +442,8 @@ WHISPER_SAMPLING_RATE = 16000
 
 
 def build_eval_augmentation(args):
-    """Test-time noise augmentation from --noise-config, or None when it isn't given."""
+    """Test-time noise augmentation from --noise-config, plus the effective settings it resolved
+    to (recorded with the results). (None, {}) when --noise-config isn't given."""
     dependent_flags = {
         "--noise-dir": args.noise_dir,
         "--noise-apply-prob": args.noise_apply_prob,
@@ -453,7 +454,7 @@ def build_eval_augmentation(args):
         passed = [flag for flag, value in dependent_flags.items() if value is not None]
         if passed:
             raise ValueError(f"{', '.join(passed)} only take effect with --noise-config, which is not set")
-        return None
+        return None, {}
 
     from preprocess.augmentation import resample_augment
     from preprocess.eval_augmentation import EvalNoiseAugmentation
@@ -462,39 +463,31 @@ def build_eval_augmentation(args):
 
     # Same YAML schema as training's --noise_config, so a benchmark can reuse its settings.
     # The loader prefixes every key with "noise_"; NoiseAugmenter's fields drop it, except noise_dir.
+    config = _load_noise_config(args.noise_config)
+    band_limit_hz = config.pop("noise_band_limit_hz", None)
+    if args.noise_band_limit_hz is not None:
+        band_limit_hz = args.noise_band_limit_hz
+
     field_names = {field.name for field in dataclasses.fields(NoiseAugmenter)}
-    noise_kwargs = {
-        key if key in field_names else key.removeprefix("noise_"): value
-        for key, value in _load_noise_config(args.noise_config).items()
-    }
+    noise_kwargs = {key if key in field_names else key.removeprefix("noise_"): value for key, value in config.items()}
     if args.noise_dir is not None:
         noise_kwargs["noise_dir"] = args.noise_dir
     if args.noise_apply_prob is not None:
         noise_kwargs["apply_prob"] = args.noise_apply_prob
-    if args.noise_band_limit_hz is not None:
-        noise_kwargs["clip_transform"] = partial(resample_augment, target_hz=args.noise_band_limit_hz)
+    if band_limit_hz:
+        noise_kwargs["clip_transform"] = partial(resample_augment, target_hz=band_limit_hz)
 
     augmenter = NoiseAugmenter(target_sampling_rate=WHISPER_SAMPLING_RATE, **noise_kwargs)
-    print(
-        f"Test-time noise augmentation: {len(augmenter.library)} clips from {augmenter.noise_dir}, "
-        f"apply_prob={augmenter.apply_prob}, snr_db_range={augmenter.snr_db_range}, "
-        f"band_limit_hz={args.noise_band_limit_hz}, "
-        + (f"seed={args.augmentation_seed}" if args.augmentation_seed is not None else "unseeded (random)")
-    )
-    return EvalNoiseAugmentation(augmenter, seed=args.augmentation_seed)
-
-
-def augmentation_columns(args) -> dict:
-    """Run-level record of the test-time augmentation, added to every results row."""
-    if args.noise_config is None:
-        return {}
-    return {
-        "augmentation_noise_config": args.noise_config,
-        "augmentation_noise_dir": args.noise_dir,
-        "augmentation_apply_prob": args.noise_apply_prob,
-        "augmentation_band_limit_hz": args.noise_band_limit_hz,
-        "augmentation_seed": args.augmentation_seed,
+    settings = {
+        "noise_config": args.noise_config,
+        "noise_dir": str(augmenter.noise_dir),
+        "apply_prob": augmenter.apply_prob,
+        "snr_db_range": str(augmenter.snr_db_range),
+        "band_limit_hz": band_limit_hz,
+        "seed": args.augmentation_seed,
     }
+    print(f"Test-time noise augmentation ({len(augmenter.library)} clips): {settings}")
+    return EvalNoiseAugmentation(augmenter, seed=args.augmentation_seed), settings
 
 
 if __name__ == "__main__":
@@ -538,7 +531,7 @@ if __name__ == "__main__":
                                         "so every model is scored on identical noisy audio. Omit for fresh randomness.")
 
     args = parser.parse_args()
-    augmentation = build_eval_augmentation(args)
+    augmentation, augmentation_settings = build_eval_augmentation(args)
 
     # Parse dataset info from command line argument
     dataset_parts = args.dataset.split(":")
@@ -596,8 +589,8 @@ if __name__ == "__main__":
         results_df["dataset"] = dataset_name
         results_df["dataset_split"] = dataset_split
         results_df["engine"] = args.engine
-        for column, value in augmentation_columns(args).items():
-            results_df[column] = value
+        for setting, value in augmentation_settings.items():
+            results_df[f"augmentation_{setting}"] = value
 
         results_df.to_csv(args.output, encoding="utf-8", index=False)
         print(f"Results saved to {args.output}")
@@ -626,8 +619,8 @@ if __name__ == "__main__":
         results_df["dataset"] = dataset_name
         results_df["dataset_split"] = dataset_split
         results_df["engine"] = args.engine
-        for column, value in augmentation_columns(args).items():
-            results_df[column] = value
+        for setting, value in augmentation_settings.items():
+            results_df[f"augmentation_{setting}"] = value
 
         results_df.to_csv(args.output, encoding="utf-8", index=False)
         print(f"Results saved to {args.output}")

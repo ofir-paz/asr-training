@@ -122,3 +122,46 @@ class TestResolveNoiseKwargs:
         accepted = set(inspect.signature(DatasetPreparator.__init__).parameters)
         unknown = [k for k in resolved if k not in accepted]
         assert not unknown, f"keys not accepted by DatasetPreparator: {unknown}"
+
+
+class TestNoiseBandLimit:
+    def test_yaml_default_is_full_bandwidth(self):
+        assert parser_module._load_noise_config(NOISE_CONFIG_PATH)["noise_band_limit_hz"] is None
+
+    def test_cli_override_sets_band_limit(self):
+        args = _parse(
+            [
+                "--noise_augmentation", "--noise_config", NOISE_CONFIG_PATH,
+                "--noise_band_limit_hz", "8000",
+                "--output_model_name", "x",
+            ]
+        )
+        assert parser_module._resolve_noise_kwargs(args)["noise_band_limit_hz"] == 8000
+
+    def test_preparator_band_limits_its_noise_library(self, tmp_path):
+        import numpy as np
+        import torch
+        import torchaudio
+        from transformers import WhisperProcessor
+
+        from preprocess.preperator import DatasetPreparator
+
+        try:
+            processor = WhisperProcessor.from_pretrained("ivrit-ai/whisper-large-v3", local_files_only=True)
+        except OSError:
+            pytest.skip("ivrit-ai/whisper-large-v3 processor is not in the local HF cache")
+
+        sr = 16000
+        white = np.random.default_rng(0).normal(0, 0.2, sr).astype(np.float32)
+        torchaudio.save(str(tmp_path / "noise.wav"), torch.from_numpy(white).unsqueeze(0), sr)
+
+        def share_above(clip, hz):
+            spectrum = np.abs(np.fft.rfft(clip)) ** 2
+            return spectrum[np.fft.rfftfreq(clip.shape[-1], 1 / sr) > hz].sum() / spectrum.sum()
+
+        full = DatasetPreparator(processor, noise_augmentation=True, noise_dir=str(tmp_path))
+        limited = DatasetPreparator(
+            processor, noise_augmentation=True, noise_dir=str(tmp_path), noise_band_limit_hz=8000
+        )
+        assert share_above(full.noise_augmenter.library.clips[0], 5000) > 0.3
+        assert share_above(limited.noise_augmenter.library.clips[0], 5000) < 1e-4
