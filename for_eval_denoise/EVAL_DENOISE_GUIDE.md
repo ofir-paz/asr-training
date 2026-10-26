@@ -155,7 +155,7 @@ The `-s` runs used Ofir's branch `origin/feature/benchmark-with-augs` (commit `7
 Each example's RNG is seeded from `(1234, sha256 of its decoded audio)`, so the noise doesn't depend on order or model.
 `make_seeded_dataset.py` uses the same code (vendored) and the same construction as the branch's `build_eval_augmentation()`, and
 loads the data like `evaluate_model.py` does (`trust_remote_code=True`, decoded by `datasets` in the main venv).
-**Verified on all 5 datasets (8,849 examples):** the noise clip and SNR equal the original `-s` CSVs for every example, for every
+**Verified on all 5 datasets (5,849 examples):** the noise clip and SNR equal the original `-s` CSVs for every example, for every
 model that has a `-s` run. That also proves the decoded input audio is identical, since the seed hashes it.
 The `na` model has **no original `-s` run on `hebrew_speech_kan`**; for that dataset the reference is `seeded_rerun` only.
 
