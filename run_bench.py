@@ -113,6 +113,9 @@ def main():
     parser.add_argument("--batch-size", type=str, default="1", help="per transcribe call batch size")
     parser.add_argument("--benchmark-timing", type=int, default=None, metavar="N",
                         help="Run each transcription N times and store all timing results")
+    parser.add_argument("--denoised-dir", type=str, default=None,
+                        help="Evaluate on the local denoised copies written by for_eval_denoise/denoise_dataset.py "
+                             "(one sub-folder per dataset label) instead of the Hugging Face originals")
     args = parser.parse_args()
 
     # Ensure engine script exists
@@ -141,7 +144,15 @@ def main():
 
     # Iterate over datasets and run evaluation
     for ds_path, ds_name, ds_output_name in datasets:
-        if not check_access(ds_path):
+        if args.denoised_dir:
+            # Same split and text column, read from the local denoised folder; its config is already baked in
+            local_dir = Path(args.denoised_dir).absolute() / ds_output_name
+            if not local_dir.exists():
+                print(f"Warning: denoised copy of '{ds_path}' not found at {local_dir}, skipping.")
+                continue
+            ds_path = ":".join([str(local_dir)] + ds_path.split(":")[1:])
+            ds_name = None
+        elif not check_access(ds_path):
             gated_msg = " (this is a gated dataset)" if is_dataset_gated(ds_path) else ""
             print(
                 f"Warning: Dataset '{ds_path}' is not accessible{gated_msg}. Ensure you are logged in to HF and have permission to access it."

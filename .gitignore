@@ -36,3 +36,14 @@ setup_scripts/
 results/
 .venv*/
 .cache/
+
+# for_eval_denoise: denoiser experiment (see for_eval_denoise/EVAL_DENOISE_GUIDE.md)
+# generated audio datasets + per-clip resume caches (GBs; re-create with the pipeline scripts)
+for_eval_denoise/denoised*/
+for_eval_denoise/seeded/
+for_eval_denoise/logs/
+# model weights and NVIDIA's model repos (download from HF: nvidia/NVIDIA-NemotronLabs-RE-USE;
+# denoise_dataset.py downloads + converts to mlx_weights/ automatically on first use)
+for_eval_denoise/mlx_weights/
+for_eval_denoise/NVIDIA-NemotronLabs-RE-USE/
+for_eval_denoise/Real-time_RE-USE/

@@ -1,0 +1,7 @@
+mlx>=0.32.4
+mlx-speech==0.5.4        # MIT; provides the pure-MLX RE-USE (SEMamba) model and the weight converter
+numpy
+safetensors
+soundfile>=0.13.1        # decodes/encodes the dataset audio (wav/flac/mp3/ogg)
+datasets
+huggingface_hub
