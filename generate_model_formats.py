@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 import sys
 import subprocess
@@ -157,13 +158,99 @@ def convert_to_ggml(model_name, output_dir):
         print(f"Cleaning up temporary directory: {temp_dir}")
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+# HF Whisper parameter-name fragments -> the OpenAI-style names mlx_whisper loads, applied in order.
+_MLX_NAME_REPLACEMENTS = [
+    ("model.", ""),
+    (".layers.", ".blocks."),
+    ("encoder.layer_norm.", "encoder.ln_post."),
+    ("decoder.layer_norm.", "decoder.ln."),
+    ("decoder.embed_tokens.", "decoder.token_embedding."),
+    ("decoder.embed_positions.weight", "decoder.positional_embedding"),
+    ("self_attn_layer_norm", "attn_ln"),
+    ("encoder_attn_layer_norm", "cross_attn_ln"),
+    ("final_layer_norm", "mlp_ln"),
+    ("self_attn.", "attn."),
+    ("encoder_attn.", "cross_attn."),
+    ("q_proj", "query"),
+    ("k_proj", "key"),
+    ("v_proj", "value"),
+    ("out_proj", "out"),
+    ("fc1", "mlp1"),
+    ("fc2", "mlp2"),
+]
+
+
+def hf_to_mlx_name(name):
+    for old, new in _MLX_NAME_REPLACEMENTS:
+        name = name.replace(old, new)
+    return name
+
+
+def convert_to_mlx(model_name, output_dir):
+    """Convert a Hugging Face Whisper checkpoint to the mlx_whisper format (config.json +
+    fp16 weights.safetensors), which mlx_whisper needs - it cannot load HF checkpoints."""
+    import numpy as np
+    import torch
+    from safetensors.numpy import save_file
+    from transformers import WhisperForConditionalGeneration
+
+    print(f"Converting model: {model_name}")
+    print(f"Output directory: {output_dir}")
+
+    model = WhisperForConditionalGeneration.from_pretrained(model_name, torch_dtype=torch.float32)
+    config = model.config
+
+    weights = {}
+    for name, tensor in model.state_dict().items():
+        # proj_out is tied to the token embedding; the encoder's positional embedding is a fixed
+        # sinusoid that mlx_whisper recomputes, so neither is stored.
+        if name == "proj_out.weight" or name == "model.encoder.embed_positions.weight":
+            continue
+        array = tensor.numpy()
+        if name.startswith("model.encoder.conv"):
+            if array.ndim == 3:  # torch Conv1d (out, in, kernel) -> MLX (out, kernel, in)
+                array = array.transpose(0, 2, 1)
+        weights[hf_to_mlx_name(name)] = np.ascontiguousarray(array.astype(np.float16))
+
+    # mlx_whisper's default alignment heads: every head of the last half of the decoder layers.
+    first_layer = config.decoder_layers // 2
+    weights["alignment_heads"] = np.array(
+        [[layer, head] for layer in range(first_layer, config.decoder_layers)
+         for head in range(config.decoder_attention_heads)],
+        dtype=np.int64,
+    )
+
+    mlx_config = {
+        "n_mels": config.num_mel_bins,
+        "n_audio_ctx": config.max_source_positions,
+        "n_audio_state": config.d_model,
+        "n_audio_head": config.encoder_attention_heads,
+        "n_audio_layer": config.encoder_layers,
+        "n_vocab": config.vocab_size,
+        "n_text_ctx": config.max_target_positions,
+        "n_text_state": config.d_model,
+        "n_text_head": config.decoder_attention_heads,
+        "n_text_layer": config.decoder_layers,
+        "model_type": "whisper",
+    }
+
+    os.makedirs(output_dir, exist_ok=True)
+    save_file(weights, os.path.join(output_dir, "weights.safetensors"))
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        json.dump(mlx_config, f, indent=4)
+
+    print("Conversion to MLX completed successfully!")
+    print(f"Converted model is available at: {output_dir}")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert a model to different formats")
     parser.add_argument("-m", "--model", default="openai/whisper-large-v3", 
                         help="Model name or path (default: openai/whisper-large-v3)")
     parser.add_argument("-o", "--output", help="Base output directory (default: model-name)")
     parser.add_argument("-f", "--formats", default=None, 
-                        help="Comma-separated list of output formats (default: all, options: ct2,onnx,ggml)")
+                        help="Comma-separated list of output formats (default: all, options: ct2,onnx,ggml,mlx)")
     parser.add_argument("-q", "--quant", default="float16",
                         help="Quantization type for CT2 format (default: float16)")
     
@@ -172,7 +259,7 @@ def main():
     model_name = args.model
     
     # Define valid formats
-    valid_formats = ["ct2", "onnx", "ggml"]
+    valid_formats = ["ct2", "onnx", "ggml", "mlx"]
     
     # If no formats specified, use all formats
     if args.formats is None:
@@ -211,6 +298,8 @@ def main():
             results[fmt] = convert_to_onnx(model_name, output_dir)
         elif fmt == "ggml":
             results[fmt] = convert_to_ggml(model_name, output_dir)
+        elif fmt == "mlx":
+            results[fmt] = convert_to_mlx(model_name, output_dir)
     
     # Print summary
     print("\n=== Conversion Summary ===")
